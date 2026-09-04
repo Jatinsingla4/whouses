@@ -6,6 +6,18 @@ const path = require('path');
 
 const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt',
   '.svelte-kit', 'coverage', '.cache', 'vendor', '__pycache__', '.turbo']);
+// CSS also lives inside <style> blocks: plain HTML pages, and every Vue/Svelte/Astro component
+const HTML_EXT = new Set(['.html', '.htm', '.vue', '.svelte', '.astro']);
+const onlyStyleBlocks = (src) => {
+  let out = blank(src);                       // same length, same newlines — line numbers survive
+  const re = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+  let m;
+  while ((m = re.exec(src))) {
+    const at = m.index + m[0].indexOf(m[1]);
+    out = out.slice(0, at) + m[1] + out.slice(at + m[1].length);
+  }
+  return out;
+};
 const CSS_EXT = new Set(['.css', '.scss', '.sass', '.less', '.styl', '.pcss', '.tcss']);
 const SRC_EXT = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',
   '.astro', '.html', '.htm', '.hbs', '.ejs', '.erb', '.php', '.twig', '.mdx']);
@@ -44,6 +56,7 @@ function* walk(dir) {
 function parseCss(file, defs) {
   let src = read(file);
   if (src === null) return;
+  if (HTML_EXT.has(path.extname(file))) src = onlyStyleBlocks(src);
   src = src.replace(/\/\*[\s\S]*?\*\//g, blank);
   if (path.extname(file) !== '.css') src = src.replace(/\/\/[^\n]*/g, blank);
   src = src.replace(/"(?:\\.|[^"\\\n])*"/g, blank).replace(/'(?:\\.|[^'\\\n])*'/g, blank);
@@ -227,6 +240,7 @@ function scanVars(root) {
 function cssRuleSpans(file) {
   let src = read(file);
   if (src === null) return [];
+  if (HTML_EXT.has(path.extname(file))) src = onlyStyleBlocks(src);
   src = src.replace(/\/\*[\s\S]*?\*\//g, blank);
   if (path.extname(file) !== '.css') src = src.replace(/\/\/[^\n]*/g, blank);
   src = src.replace(/"(?:\\.|[^"\\\n])*"/g, blank).replace(/'(?:\\.|[^'\\\n])*'/g, blank)
@@ -364,7 +378,7 @@ function buildIndex(root) {
   for (const f of walk(root)) {
     const e = path.extname(f);
     if (CSS_EXT.has(e)) cssFiles.push(f);
-    else if (SRC_EXT.has(e)) srcFiles.push(f);
+    else if (SRC_EXT.has(e)) { srcFiles.push(f); if (HTML_EXT.has(e)) cssFiles.push(f); }
   }
   for (const f of cssFiles) parseCss(f, defs);
   const names = new Set(Object.keys(defs));
@@ -626,7 +640,8 @@ indexed ${ix.cssFiles.length} stylesheet(s), ${ix.srcFiles.length} source file(s
     if (ix.skipped.length) console.log(C.dim(`skipped ${ix.skipped.length} unreadable file(s)`));
     return;
   }
-  if (fs.existsSync(target) && CSS_EXT.has(path.extname(target))) return reportImpact(ix, target);
+  const ext = path.extname(target);
+  if (fs.existsSync(target) && (CSS_EXT.has(ext) || HTML_EXT.has(ext))) return reportImpact(ix, target);
   reportClass(ix, target.replace(/^\./, ''));
 }
 

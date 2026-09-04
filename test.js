@@ -172,5 +172,31 @@ assert.ok(remaining.includes('@media (max-width: 600px)') && remaining.includes(
 const braces = (t) => [...t].filter((c) => c === '{').length === [...t].filter((c) => c === '}').length;
 assert.ok(braces(produced) && braces(remaining), 'both files still have balanced braces');
 
+// ---- CSS inside <style> blocks: plain HTML, and every Vue/Svelte/Astro component ----
+w('sfc/Card.vue', [
+  '<template>',
+  '  <div class="sfc-card"><b class="sfc-title">hi</b></div>',
+  '</template>',
+  '<style scoped>',
+  '.sfc-card { padding: 4px }',
+  '.sfc-title { font-weight: 700 }',
+  '.sfc-dead { color: red }',
+  '</style>',
+].join('\n'));
+w('sfc/page.html', [
+  '<style>',
+  '  .page-hero { height: 40px }',
+  '</style>',
+  '<div class="page-hero">x</div>',
+].join('\n'));
+const ix5 = buildIndex(path.join(root, 'sfc'));
+assert.ok(ix5.defs['sfc-card'], 'class defined inside a Vue <style> block is found');
+assert.strictEqual(ix5.defs['sfc-card'][0].line, 5, 'line number is the real line in the .vue file');
+assert.ok(ix5.defs['page-hero'], 'class defined inside an HTML <style> block is found');
+assert.strictEqual(ix5.defs['page-hero'][0].line, 2);
+assert.ok((ix5.uses['sfc-card'] || []).length, 'the template markup counts as a usage');
+assert.ok(!ix5.uses['sfc-dead'], 'unused class in a <style> block is still an orphan');
+assert.ok(!ix5.defs['template'] && !ix5.defs['div'], 'markup outside <style> is never parsed as CSS');
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — all checks passed');

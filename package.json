@@ -1,7 +1,7 @@
 {
   "name": "whouses",
-  "version": "1.0.1",
-  "description": "Find who uses your CSS. Traces classes built at runtime that grep cannot see, flags Tailwind classes the JIT scanner will silently drop, and indexes CSS custom properties across CSS and JS.",
+  "version": "1.1.0",
+  "description": "Find who uses your CSS \u2014 including classes built at runtime that grep cannot see. Reads .css/.scss/.less and <style> blocks in HTML, Vue, Svelte and Astro. Flags Tailwind classes the JIT silently drops.",
   "keywords": [
     "css",
     "tracecss",
