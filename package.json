@@ -1,0 +1,56 @@
+{
+  "name": "whouses",
+  "version": "1.0.0",
+  "description": "Find who uses your CSS. Traces classes built at runtime that grep cannot see, flags Tailwind classes the JIT scanner will silently drop, and indexes CSS custom properties across CSS and JS.",
+  "keywords": [
+    "css",
+    "tracecss",
+    "tcss",
+    "refactor",
+    "dead-code",
+    "unused-css",
+    "css-modules",
+    "static-analysis",
+    "cli",
+    "scss",
+    "react",
+    "vue",
+    "svelte",
+    "developer-tools",
+    "compiler",
+    "linter",
+    "tailwind",
+    "tailwindcss",
+    "design-tokens",
+    "css-variables",
+    "custom-properties"
+  ],
+  "bin": {
+    "whouses": "./whouses.js",
+    "tracecss": "./tracecss.js"
+  },
+  "main": "whouses.js",
+  "files": [
+    "whouses.js",
+    "tracecss.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test.js && node test-tracecss.js",
+    "prepublishOnly": "node test.js && node test-tracecss.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT",
+  "author": "Jatin Singla",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jatinsingla4/whouses.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jatinsingla4/whouses/issues"
+  },
+  "homepage": "https://github.com/Jatinsingla4/whouses#readme"
+}
