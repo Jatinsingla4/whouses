@@ -198,5 +198,18 @@ assert.ok((ix5.uses['sfc-card'] || []).length, 'the template markup counts as a 
 assert.ok(!ix5.uses['sfc-dead'], 'unused class in a <style> block is still an orphan');
 assert.ok(!ix5.defs['template'] && !ix5.defs['div'], 'markup outside <style> is never parsed as CSS');
 
+// ---- :global() names come from libraries and are never "dead" ----
+w('glb/s.module.scss', [
+  '.mine { color: red }',
+  '.wrap :global(.swiper-wrapper) { align-items: flex-start }',
+  ':global .slick-slide { margin: 0 }',
+].join('\n'));
+w('glb/C.jsx', '<div className={s.mine}/>');
+const ix6 = buildIndex(path.join(root, 'glb'));
+assert.ok(ix6.defs['swiper-wrapper'].every((d) => d.external), 'a :global(...) name is external');
+assert.ok(ix6.defs['slick-slide'].every((d) => d.external), 'bare :global prefix marks the rest external');
+assert.ok(ix6.defs['wrap'].every((d) => !d.external), 'a name outside :global() stays yours');
+assert.ok(ix6.defs['mine'].every((d) => !d.external));
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — all checks passed');
