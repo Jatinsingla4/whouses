@@ -26,8 +26,8 @@
     "custom-properties"
   ],
   "bin": {
-    "whouses": "./whouses.js",
-    "tracecss": "./tracecss.js"
+    "whouses": "whouses.js",
+    "tracecss": "tracecss.js"
   },
   "main": "whouses.js",
   "files": [
