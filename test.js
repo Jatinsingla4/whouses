@@ -88,7 +88,21 @@ const v = scanVars(root);
 assert.strictEqual(v.defs['--brand'].length, 1, 'variable defined once');
 assert.strictEqual(new Set(v.uses['--brand'].map((u) => u.file)).size, 2, 'used from both CSS and JS');
 assert.ok(!v.uses['--dead'], 'unused variable has no users');
-assert.ok(!v.defs['--brand'].some((d) => d.file.endsWith('.js')), 'JS strings never count as definitions');
+// a custom property is just as often defined from JS as from CSS
+w('src/jsdef.tsx', [
+  'const A = () => <div style={{ ["--s" as string]: "calc(100vw / 1440)" }}/>;',
+  'const poppins = { variable: "--font-poppins" };',
+  'el.style.setProperty("--live", x);',
+  'const use = `calc(var(--s) * 2)`;',
+].join('\n'));
+w('src/theme.css', '@theme inline {\n  --color-bg: var(--raw);\n  --font-sans: var(--font-poppins);\n}\n:root { --raw: #000 }');
+const v2 = scanVars(root);
+assert.ok(v2.defs['--s'], 'inline style object key is a definition');
+assert.ok(v2.defs['--font-poppins'], 'next/font variable is a definition');
+assert.ok(v2.defs['--live'], 'setProperty is a definition');
+assert.ok(v2.theme.has('--color-bg') && v2.theme.has('--font-sans'), '@theme names collected');
+assert.ok(!v2.theme.has('--raw'), 'a :root name outside @theme is not a theme token');
+assert.ok(v2.uses['--s'].length, 'var(--s) still counted as a use');
 
 // ---- rule spans: a changed line must map to the rule that owns it ----
 const spanFile = w('src/span.css', [

@@ -187,7 +187,7 @@ function scanTailwind(root) {
 
 // ---------- CSS custom properties: the one index that works everywhere ----------
 function scanVars(root) {
-  const defs = Object.create(null), uses = Object.create(null);
+  const defs = Object.create(null), uses = Object.create(null), theme = new Set();
   for (const f of walk(root)) {
     const ext = path.extname(f);
     const isCss = CSS_EXT.has(ext);
@@ -195,15 +195,32 @@ function scanVars(root) {
     const src = read(f);
     if (src === null) continue;
     const offs = lineOffsets(src);
+    const at = (i) => ({ file: f, line: lineAt(offs, i) });
     let m;
     if (isCss) {
       const d = /(--[\w-]+)\s*:/g;
-      while ((m = d.exec(src))) (defs[m[1]] ||= []).push({ file: f, line: lineAt(offs, m.index) });
+      while ((m = d.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
+      // Tailwind v4: names declared in @theme are consumed by the framework itself to
+      // generate utilities (bg-background, font-sans). They are used, just not via var().
+      const t = /@theme[^{]*\{/g;
+      while ((m = t.exec(src))) {
+        let depth = 1, i = m.index + m[0].length;
+        for (; i < src.length && depth; i++) { if (src[i] === '{') depth++; else if (src[i] === '}') depth--; }
+        for (const v of src.slice(m.index, i).matchAll(/(--[\w-]+)\s*:/g)) theme.add(v[1]);
+      }
+    } else {
+      // a custom property can just as easily be defined from JS
+      const inline = /['"](--[\w-]+)['"]\s*(?:as\s+\w+\s*)?\]?\s*:/g;      // style={{ ["--s"]: ... }}
+      while ((m = inline.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
+      const setp = /setProperty\(\s*['"](--[\w-]+)['"]/g;                    // el.style.setProperty('--s', …)
+      while ((m = setp.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
+      const font = /variable\s*:\s*['"](--[\w-]+)['"]/g;                     // next/font
+      while ((m = font.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
     }
     const u = /var\(\s*(--[\w-]+)/g;
-    while ((m = u.exec(src))) (uses[m[1]] ||= []).push({ file: f, line: lineAt(offs, m.index) });
+    while ((m = u.exec(src))) (uses[m[1]] ||= []).push(at(m.index));
   }
-  return { defs, uses };
+  return { defs, uses, theme };
 }
 
 // ---------- rule spans: which lines does each rule occupy ----------
@@ -433,10 +450,19 @@ function main(argv) {
 
   const standalone = args.includes('--tailwind') || args.includes('--vars') || args.includes('--diff') || args.includes('--install-hook');
   if (!standalone && !Object.keys(ix.defs).length) {
+    const tw = ix.cssFiles.some((f) => /@tailwind\b|@import\s+["']tailwindcss/.test(read(f) || '')) ||
+      ['tailwind.config.js', 'tailwind.config.ts', 'tailwind.config.mjs', 'tailwind.config.cjs']
+        .some((f) => fs.existsSync(path.join(root, f)));
     console.error(C.y('no CSS classes found under ' + root));
     console.error(C.dim('  scanned ' + ix.cssFiles.length + ' stylesheet(s), ' + ix.srcFiles.length + ' source file(s).'));
-    console.error(C.dim('  styles-in-JS (styled-components, emotion) and Tailwind utilities are not indexed —'));
-    console.error(C.dim('  whouses reads .css/.scss/.less files. Point it at one with --root <dir>.'));
+    if (tw) {
+      console.error('\n  this looks like a ' + C.b('Tailwind') + ' project. these are the commands for you:\n');
+      console.error('    ' + C.b('whouses --tailwind') + C.dim('   classes the JIT scanner silently drops — real bugs'));
+      console.error('    ' + C.b('whouses --vars') + C.dim('       your design tokens, and who reads them'));
+    } else {
+      console.error(C.dim('  styles-in-JS (styled-components, emotion) are not indexed —'));
+      console.error(C.dim('  whouses reads .css/.scss/.less files. Point it at one with --root <dir>.'));
+    }
     process.exitCode = 1;
     if (!json) return;
   }
@@ -472,7 +498,9 @@ function main(argv) {
     for (const n of all) {
       const d = v.defs[n] || [], u = v.uses[n] || [];
       const where = d.length ? rel(root, d[0].file) + ':' + d[0].line : C.r('never defined');
-      if (!u.length) console.log(C.y(n.padEnd(28)) + where + C.dim('  used by nobody'));
+      if (v.theme.has(n)) console.log(C.g(n.padEnd(28)) + where + C.dim('  @theme token — Tailwind generates utilities from it') +
+        (u.length ? '  ' + u.length + ' var() use(s)' : ''));
+      else if (!u.length) console.log(C.y(n.padEnd(28)) + where + C.dim('  used by nobody'));
       else console.log(C.g(n.padEnd(28)) + where + '  ' + new Set(u.map((x) => x.file)).size + ' file(s), ' + u.length + ' use(s)');
     }
     return;
