@@ -1,5 +1,10 @@
 # whouses
 
+[![npm](https://img.shields.io/npm/v/whouses?color=cb3837&logo=npm)](https://www.npmjs.com/package/whouses)
+[![test](https://github.com/Jatinsingla4/whouses/actions/workflows/test.yml/badge.svg)](https://github.com/Jatinsingla4/whouses/actions/workflows/test.yml)
+[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Jatinsingla4/whouses/blob/main/package.json)
+[![license](https://img.shields.io/npm/l/whouses?color=blue)](LICENSE)
+
 **You need to change a CSS class. Who breaks?**
 
 ```bash
@@ -9,10 +14,10 @@ npx whouses .btn-primary
 ```
 .btn-primary
   defined  styles/app.css:2  .btn-primary
-  used by  2 file(s), 3 site(s)
-    src/Button.jsx:2   <button className={`btn btn-${kind}`}>   ~dynamic
+  used by  3 file(s), 3 site(s)
+    src/Button.jsx:1 ~dynamic  <button className={`btn btn-${kind}`}>go</button>
     src/Toolbar.vue:1  <button class="btn btn-primary">Save</button>
-    src/legacy.js:1    document.querySelector('.btn-primary')
+    src/legacy.js:1  document.querySelector('.btn-primary').focus();
 ```
 
 No install, no config, no dependencies. Point it at a repo and it answers.
