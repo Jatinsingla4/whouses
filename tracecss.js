@@ -3,7 +3,7 @@
 // tracecss — CSS with backtracing built in. Every .css file is already valid .tcss.
 const fs = require('fs');
 const path = require('path');
-const { buildIndex } = require('./whouses');
+const { buildIndex, sanitizeCss } = require('./whouses');
 
 const MARK = '[tracecss]';
 const blank = (m) => m.replace(/[^\n]/g, ' ');
@@ -46,12 +46,23 @@ function parseTcss(file) {
   return { file, component: comp ? comp[1] : null, rules, src };
 }
 
-// plain CSS out — directives blanked in place so line numbers survive
-const compile = (src) => src
-  .replace(/@component\s+[\w-]+\s*;[ \t]*\r?\n?/g, '')
-  .replace(/@(?:deprecated|owner|since)\s*\([^)]*\)\s*/g, '')
-  .replace(/@(?:public|private|internal)\s*/g, '')
-  .replace(/^[ \t]*\/\* @used-by [\s\S]*?\[tracecss\] \*\/[ \t]*\r?\n/gm, '');
+// plain CSS out. Directives are located on a sanitized copy (comments and string bodies
+// blanked) and cut by offset, so `content: "@public"` and a @deprecated message containing
+// ')' both survive untouched.
+// matched on the SANITIZED copy, where any ')' inside a message has already been
+// blanked — so [^)]* cannot run past the end of the directive
+const DIRECTIVE = /@component\s+[\w-]+\s*;[ \t]*\r?\n?|@(?:deprecated|owner|since)\s*\([^)]*\)\s*|@(?:public|private|internal)\b\s*/g;
+function compile(src) {
+  const clean = sanitizeCss(src, true);
+  const cuts = [];
+  DIRECTIVE.lastIndex = 0;
+  let m;
+  while ((m = DIRECTIVE.exec(clean))) cuts.push([m.index, m.index + m[0].length]);
+  let out = '', cursor = 0;
+  for (const [a, b] of cuts) { out += src.slice(cursor, a); cursor = b; }
+  out += src.slice(cursor);
+  return out.replace(/^[ \t]*\/\* @used-by [\s\S]*?\[tracecss\] \*\/[ \t]*\r?\n/gm, '');
+}
 
 const owns = (component, file) => {
   if (!component) return false;
@@ -163,13 +174,29 @@ function sheetsIn(root) {
   return out;
 }
 
-function run(root, { write, doAnnotate, quiet }) {
+function run(root, { write, doAnnotate, quiet, force }) {
   const sheets = sheetsIn(root);
   if (!sheets.length) { console.error(yel('no .tcss files under ' + root) + dim('\n  rename a .css file to .tcss — it already compiles.')); return 1; }
   const ix = buildIndex(root);
   const problems = check(ix, sheets);
 
-  if (write) for (const s of sheets) fs.writeFileSync(s.file.replace(/\.tcss$/, '.css'), compile(s.src));
+  if (write) {
+    for (const s of sheets) {
+      const out = s.file.replace(/\.tcss$/, '.css');
+      // a .css next to a .tcss may be a hand-written file, not our output. Only replace
+      // one we previously generated (byte-identical to what compile() produces).
+      if (fs.existsSync(out) && fs.readFileSync(out, 'utf8') !== compile(s.src)) {
+        const prev = fs.readFileSync(out, 'utf8');
+        const ours = sheets.some((o) => prev === compile(o.src)) || prev.trim() === '';
+        if (!ours && !force) {
+          console.error(red('refusing to overwrite ') + path.relative(root, out) +
+            dim(' — it does not look generated. move it aside, or pass --force.'));
+          return 1;
+        }
+      }
+      fs.writeFileSync(out, compile(s.src));
+    }
+  }
   if (doAnnotate) for (const s of sheets) fs.writeFileSync(s.file, annotate(ix, s));
 
   const errs = problems.filter((p) => p.level === 'error');
@@ -192,7 +219,8 @@ function run(root, { write, doAnnotate, quiet }) {
 function main() {
   const [cmd, dirArg] = process.argv.slice(2).filter((a) => !a.startsWith('-'));
   const root = path.resolve(dirArg || '.');
-  if (cmd === 'build') return process.exit(run(root, { write: true, doAnnotate: true }));
+  const force = process.argv.includes('--force');
+  if (cmd === 'build') return process.exit(run(root, { write: true, doAnnotate: true, force }));
   if (cmd === 'check') return process.exit(run(root, {}));
   if (cmd === 'annotate') return process.exit(run(root, { doAnnotate: true }));
   if (cmd === 'watch') {

@@ -92,6 +92,23 @@ npx whouses --dynamic    # always check this before acting on --orphans
 
 The bias is deliberate: a false positive wastes a second, a false negative ships a bug.
 
+## How it reads your code
+
+Not with regexes over raw text. Stylesheets go through a character-level lexer that
+tracks comments, strings and `url()`, so `content: "/*"`, `url(https://x)`, a
+`;`-terminated `@import` and nested rules all parse correctly — and every rule carries
+exact character offsets, so `--extract` and `--rename` edit those offsets and nothing else.
+
+Source files go through a small JS lexer, so a `//` comment, a regex literal, or an
+apostrophe in `<p>it's here</p>` can never be mistaken for a string and hide the class
+next to it. Missing a usage is the one failure this tool must not have: it is what makes
+a developer delete live CSS.
+
+Write commands refuse rather than guess. `--extract` will not overwrite an existing
+component stylesheet, will not move a class defined in two sheets (the cascade would
+flip), and will not split a class from its `@media` override. `--rename` will not
+half-apply. `tracecss build` will not replace a `.css` it did not generate.
+
 ## Requirements
 
 Node 16+. Zero dependencies.
@@ -189,6 +206,23 @@ npx tracecss watch src/      # keep it all fresh while you code
 | PurgeCSS | guesses, then deletes | no | no | build setup |
 | CSS Modules | n/a | scoping only, no visibility | no | rewrite every import |
 | **tracecss** | **yes, and says so** | **`@private` at build time** | **yes, in the file** | **one rename** |
+
+## How it reads your code
+
+Not with regexes over raw text. Stylesheets go through a character-level lexer that
+tracks comments, strings and `url()`, so `content: "/*"`, `url(https://x)`, a
+`;`-terminated `@import` and nested rules all parse correctly — and every rule carries
+exact character offsets, so `--extract` and `--rename` edit those offsets and nothing else.
+
+Source files go through a small JS lexer, so a `//` comment, a regex literal, or an
+apostrophe in `<p>it's here</p>` can never be mistaken for a string and hide the class
+next to it. Missing a usage is the one failure this tool must not have: it is what makes
+a developer delete live CSS.
+
+Write commands refuse rather than guess. `--extract` will not overwrite an existing
+component stylesheet, will not move a class defined in two sheets (the cascade would
+flip), and will not split a class from its `@media` override. `--rename` will not
+half-apply. `tracecss build` will not replace a `.css` it did not generate.
 
 ## Requirements
 

@@ -1,6 +1,6 @@
 {
   "name": "whouses",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "Find who uses your CSS \u2014 including classes built at runtime that grep cannot see. Reads .css/.scss/.less and <style> blocks in HTML, Vue, Svelte and Astro. Flags Tailwind classes the JIT silently drops.",
   "keywords": [
     "css",
@@ -37,8 +37,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test.js && node test-tracecss.js",
-    "prepublishOnly": "node test.js && node test-tracecss.js"
+    "test": "node test.js && node test-tracecss.js && node test-edge.js",
+    "prepublishOnly": "node test.js && node test-tracecss.js && node test-edge.js"
   },
   "engines": {
     "node": ">=16"

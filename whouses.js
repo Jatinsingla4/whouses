@@ -20,7 +20,7 @@ const onlyStyleBlocks = (src) => {
 };
 const CSS_EXT = new Set(['.css', '.scss', '.sass', '.less', '.styl', '.pcss', '.tcss']);
 const SRC_EXT = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',
-  '.astro', '.html', '.htm', '.hbs', '.ejs', '.erb', '.php', '.twig', '.mdx']);
+  '.astro', '.html', '.htm', '.hbs', '.ejs', '.erb', '.php', '.twig', '.mdx', '.md']);
 
 // ponytail: heuristic scanner, not a parser. Reports file:line so a human verifies.
 // Upgrade path: swap parseCss for postcss + parseSrc for babel/ts-morph if false
@@ -53,63 +53,244 @@ function* walk(dir) {
 }
 
 // ---------- CSS side: where is each class DEFINED ----------
-function parseCss(file, defs) {
-  let src = read(file);
-  if (src === null) return;
-  if (HTML_EXT.has(path.extname(file))) src = onlyStyleBlocks(src);
-  src = src.replace(/\/\*[\s\S]*?\*\//g, blank);
-  if (path.extname(file) !== '.css') src = src.replace(/\/\/[^\n]*/g, blank);
-  src = src.replace(/"(?:\\.|[^"\\\n])*"/g, blank).replace(/'(?:\\.|[^'\\\n])*'/g, blank);
-  src = src.replace(/@component\s+[\w-]+\s*;/g, blank)          // tracecss directives are not selectors
-           .replace(/@(?:deprecated|owner|since)\s*\([^)]*\)/g, blank)
-           .replace(/@(?:public|private|internal)\b/g, blank);
-  const offs = lineOffsets(src);
-  const rule = /([^{}]+)\{/g;
-  let m;
-  while ((m = rule.exec(src))) {
-    const sel = m[1].trim();
-    if (!sel || sel[0] === '@' || !sel.includes('.')) continue;
-    const line = lineAt(offs, m.index + m[1].search(/\S/));
-    // :global(...) names belong to a library, not to you — they are generated at runtime
-    // (swiper-wrapper, slick-slide, leaflet-*) and are never dead just because your code
-    // does not mention them.
-    const globals = [];
-    const gp = /:global\s*\(/g;
-    let g;
-    while ((g = gp.exec(sel))) {
-      let depth = 1, i = g.index + g[0].length;
-      for (; i < sel.length && depth; i++) { if (sel[i] === '(') depth++; else if (sel[i] === ')') depth--; }
-      globals.push([g.index, i]);
+// A regex pipeline cannot survive `content: "/*"`, `url(https://x)`, a `;`-terminated
+// at-rule, or nested rules. So walk the stylesheet once, tracking comments, strings and
+// url() properly, and record real character offsets — --extract cuts on those, never on
+// whole lines (cutting lines destroyed any rule sharing a line with the one being moved).
+const CLASS_RE = /\.(-?(?:[_a-zA-Z -￿]|\\.)(?:[-\w -￿]|\\.)*)/g;
+const unesc = (s) => s.replace(/\\(.)/g, '$1');
+
+// blank comments, string bodies and url() contents in place — same length, same
+// newlines — so brace scanning cannot be fooled by `content: "/*"` or `url(https://x)`
+// while every offset still points at the real file.
+function sanitizeCss(src, lineComments) {
+  const a = src.split('');
+  const n = src.length;
+  const wipe = (from, to) => { for (let k = from; k < to && k < n; k++) if (a[k] !== '\n') a[k] = ' '; };
+  const endString = (start) => {
+    const q = src[start];
+    let j = start + 1;
+    while (j < n) {
+      if (src[j] === '\\') { j += 2; continue; }
+      if (src[j] === q) return j + 1;
+      j++;
     }
-    const bare = /:global(?!\s*\()/.exec(sel);
-    if (bare) globals.push([bare.index, sel.length]);
-    const cls = /\.(-?[_a-zA-Z][\w-]*)/g;
-    let c;
-    while ((c = cls.exec(sel))) {
-      const external = globals.some(([a, b]) => c.index > a && c.index < b);
-      (defs[c[1]] ||= []).push({ file, line, selector: sel.replace(/\s+/g, ' '), external });
+    return j;
+  };
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '*') {
+      let j = i + 2;
+      while (j < n && !(src[j] === '*' && src[j + 1] === '/')) j++;
+      j = Math.min(j + 2, n); wipe(i, j); i = j; continue;
+    }
+    if (lineComments && c === '/' && src[i + 1] === '/') {
+      let j = i;
+      while (j < n && src[j] !== '\n') j++;
+      wipe(i, j); i = j; continue;
+    }
+    if (c === '"' || c === "'") { const j = endString(i); wipe(i, j); i = j; continue; }
+    if ((c === 'u' || c === 'U') && /^url\(/i.test(src.slice(i, i + 4))) {
+      let j = i + 4;
+      while (j < n && src[j] !== ')') {
+        if (src[j] === '"' || src[j] === "'") { j = endString(j); continue; }
+        j++;
+      }
+      j = Math.min(j + 1, n); wipe(i, j); i = j; continue;
+    }
+    i++;
+  }
+  return a.join('');
+}
+
+function lexCss(src, lineComments) {
+  const clean = sanitizeCss(src, lineComments);
+  const rules = [], stack = [];
+  const n = clean.length;
+  let i = 0, bound = 0;
+  while (i < n) {
+    const c = clean[i];
+    // a ';' ends a statement at-rule (@import, @use) and every declaration, so the next
+    // selector starts after it — without this the rule after @charset vanished, and a
+    // nested selector was attributed to the declaration above it
+    if (c === ';') { bound = ++i; continue; }
+    if (c === '{') { stack.push({ open: i, sel: clean.slice(bound, i), selStart: bound }); bound = ++i; continue; }
+    if (c === '}') {
+      const top = stack.pop();
+      if (top) {
+        const trimmed = top.sel.trim();
+        if (trimmed && trimmed[0] !== '@') {
+          rules.push({
+            selector: trimmed.replace(/\s+/g, ' '), depth: stack.length,
+            selStart: top.selStart + (top.sel.length - top.sel.trimStart().length),
+            rawSel: top.sel.slice(top.sel.length - top.sel.trimStart().length),
+            open: top.open, close: i,
+          });
+        }
+      }
+      bound = ++i; continue;
+    }
+    i++;
+  }
+  return rules;
+}
+
+// tracecss directives sit in front of the selector. The quoted argument is matched to
+// its closing quote first, so a message containing ')' cannot eat the rule after it.
+const TCSS_DIRECTIVE = /@component\s+[\w-]+\s*;|@(?:deprecated|owner|since)\s*\([^)]*\)|@(?:public|private|internal)\b/g;
+const stripDirectives = (src) => {
+  const clean = sanitizeCss(src, true);          // messages and comments already blanked here
+  const a = src.split('');
+  TCSS_DIRECTIVE.lastIndex = 0;
+  let m;
+  while ((m = TCSS_DIRECTIVE.exec(clean))) {
+    for (let k = m.index; k < m.index + m[0].length; k++) if (a[k] !== '\n') a[k] = ' ';
+  }
+  return a.join('');
+};
+
+function cssSource(file) {
+  let src = read(file);
+  if (src === null) return null;
+  const ext = path.extname(file);
+  if (HTML_EXT.has(ext)) src = onlyStyleBlocks(src);
+  if (ext === '.tcss') src = stripDirectives(src);
+  return src;
+}
+
+// classes in a selector, with the :global(...) regions that make a name a library's, not yours
+function selectorClasses(sel) {
+  const globals = [];
+  const gp = /:global\s*\(/g;
+  let g;
+  while ((g = gp.exec(sel))) {
+    let depth = 1, i = g.index + g[0].length;
+    for (; i < sel.length && depth; i++) { if (sel[i] === '(') depth++; else if (sel[i] === ')') depth--; }
+    globals.push([g.index, i]);
+  }
+  const bare = /:global(?!\s*\()/.exec(sel);
+  if (bare) globals.push([bare.index, sel.length]);
+  const out = [];
+  CLASS_RE.lastIndex = 0;
+  let c;
+  while ((c = CLASS_RE.exec(sel))) {
+    out.push({
+      name: unesc(c[1]), raw: c[1], at: c.index + 1,
+      external: globals.some(([a, b]) => c.index > a && c.index < b),
+    });
+  }
+  return out;
+}
+
+function parseCss(file, defs) {
+  const src = cssSource(file);
+  if (src === null) return;
+  const offs = lineOffsets(src);
+  for (const r of lexCss(src, path.extname(file) !== '.css')) {
+    for (const c of selectorClasses(r.selector)) {
+      (defs[c.name] ||= []).push({ file, line: lineAt(offs, r.selStart), selector: r.selector, external: c.external });
     }
   }
+}
+
+function cssRuleSpans(file) {
+  const src = cssSource(file);
+  if (src === null) return [];
+  const offs = lineOffsets(src);
+  return lexCss(src, path.extname(file) !== '.css').map((r) => ({
+    file, depth: r.depth, selector: r.selector,
+    classes: selectorClasses(r.selector).map((c) => c.name),
+    start: lineAt(offs, r.selStart), end: lineAt(offs, r.close),
+    from: r.selStart, to: r.close + 1,
+  }));
 }
 
 // ---------- source side: who USES each class ----------
 const AGGRESSIVE = /(?::class|v-bind:class|querySelector(?:All)?|getElementsByClassName|classList\.\w+|\.matches)\s*[=(]\s*$/;
-const STR = /(['"`])((?:\\[\s\S]|(?!\1)[\s\S])*?)\1/g;
+// '<' and '>' are deliberately absent: in JSX a '/' after '<' is a closing tag, and
+// treating `</p>` as the start of a regex swallowed the rest of the line — including
+// the className next to it. No real code writes `a < /re/.test(b)`.
+const REGEX_OK = new Set(['', '(', '[', '{', '=', ':', ',', ';', '!', '&', '|', '?', '+', '-', '*', '%', '~', '^', 'return']);
 
+// A regex cannot tell a string from an apostrophe in prose, and getting that wrong
+// hides every class after it — the one failure this tool must never have. So walk the
+// source once and emit only real string/template literals: comments and regex literals
+// are skipped, and ${...} is matched by counting braces rather than by a pattern.
+function lexStrings(src) {
+  const out = [];
+  const n = src.length;
+  let i = 0, prev = '';
+  while (i < n) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; continue; }
+    if (c === '/' && src[i + 1] === '*') { i += 2; while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++; i += 2; continue; }
+    if (c === '/' && REGEX_OK.has(prev)) {
+      let j = i + 1, inClass = false, closed = false;
+      for (; j < n; j++) {
+        const d = src[j];
+        if (d === '\\') { j++; continue; }
+        if (d === '\n') break;
+        if (d === '[') inClass = true;
+        else if (d === ']') inClass = false;
+        else if (d === '/' && !inClass) { closed = true; break; }
+      }
+      if (closed) { i = j + 1; prev = '/'; continue; }
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c, start = ++i;
+      let body = '';
+      while (i < n) {
+        const d = src[i];
+        if (d === '\\') { body += '  '; i += 2; continue; }   // 2 chars in, 2 out: offsets stay aligned
+        if (q === '`' && d === '$' && src[i + 1] === '{') {
+          let depth = 1, j = i + 2;
+          while (j < n && depth) { if (src[j] === '{') depth++; else if (src[j] === '}') depth--; j++; }
+          body += src.slice(i, j);
+          i = j;
+          continue;
+        }
+        if (d === q) { i++; break; }
+        if (q !== '`' && d === '\n') break;                   // unterminated: not a real string
+        body += d; i++;
+      }
+      out.push({ quote: q, body, index: start });
+      prev = q;
+      continue;
+    }
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
+}
+
+// split a template body on ${...} by counting braces, so `${pick({a:{b:1}})}` works
 function templateParts(s) {
   const parts = [], interps = [];
-  const re = /\$\{(?:[^{}]|\{[^{}]*\})*\}/g;
-  let last = 0, m;
-  while ((m = re.exec(s))) {
-    parts.push({ text: s.slice(last, m.index), pre: last > 0, post: true });
-    interps.push(m[0]);                 // scanned too: `a ${x ? 'b' : 'c'}` hides real classes
-    last = m.index + m[0].length;
+  let i = 0, last = 0;
+  while (i < s.length) {
+    if (s[i] === '$' && s[i + 1] === '{') {
+      let depth = 1, j = i + 2;
+      while (j < s.length && depth) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; j++; }
+      parts.push({ text: s.slice(last, i), off: last, pre: last > 0, post: true });
+      interps.push({ text: s.slice(i, j), off: i });
+      i = j; last = j;
+      continue;
+    }
+    i++;
   }
-  parts.push({ text: s.slice(last), pre: last > 0, post: false });
+  parts.push({ text: s.slice(last), off: last, pre: last > 0, post: false });
   return { parts, interps };
 }
 
-function parseSrc(file, names, prefixIdx, uses, camelMap) {
+const tokensAt = (text, base) => {
+  const out = [], re = /\S+/g;
+  let m;
+  while ((m = re.exec(text))) out.push({ t: m[0], at: base + m.index });
+  return out;
+};
+
+function parseSrc(file, names, prefixIdx, suffixIdx, uses, camelMap) {
   const src = read(file);
   if (src === null) return;
   const offs = lineOffsets(src);
@@ -124,50 +305,74 @@ function parseSrc(file, names, prefixIdx, uses, camelMap) {
   };
   const tryToken = (t, i, aggressive) => {
     if (names.has(t)) return hit(t, i, 'static');
-    if (aggressive && names.has(t.replace(/^[.#]/, ''))) return hit(t.replace(/^[.#]/, ''), i, 'static');
+    const bare = t.replace(/^[.#]/, '');
+    if (aggressive && names.has(bare)) return hit(bare, i, 'static');
   };
 
-  // 1. every string literal
-  let m;
-  STR.lastIndex = 0;
-  while ((m = STR.exec(src))) {
-    const body = m[2], at = m.index + 1;
-    const aggressive = AGGRESSIVE.test(src.slice(Math.max(0, m.index - 60), m.index));
-    if (m[1] === '`') {
-      const { parts, interps } = templateParts(body);
+  // "it's" is prose, not an open quote. Blanking the apostrophe between two word
+  // characters keeps every offset intact and can never hit a real delimiter, which
+  // is always preceded by =, (, whitespace or similar.
+  const lexable = src.replace(/(\w)'(\w)/g, (_, a, b) => a + ' ' + b);
+
+  for (const s of lexStrings(lexable)) {
+    const at0 = s.index;
+    const aggressive = AGGRESSIVE.test(src.slice(Math.max(0, at0 - 61), at0 - 1));
+    if (s.quote === '`') {
+      const { parts, interps } = templateParts(s.body);
       for (const ex of interps) {
-        let q;
-        const inner = /(['"])((?:\\[\s\S]|(?!\1)[^\n])*?)\1/g;
-        while ((q = inner.exec(ex))) for (const t of q[2].split(/\s+/)) if (t) tryToken(t, at, aggressive);
+        for (const q of lexStrings(ex.text)) {
+          if (q.quote === '`') continue;
+          for (const tk of tokensAt(q.body, at0 + ex.off + q.index)) tryToken(tk.t, tk.at, aggressive);
+        }
       }
       for (const p of parts) {
-        const toks = p.text.split(/\s+/);
-        toks.forEach((t, k) => {
-          if (!t) return;
-          const edge = (k === 0 && p.pre && !/^\s/.test(p.text)) ||
-                       (k === toks.length - 1 && p.post && !/\s$/.test(p.text));
-          if (edge) { if (t.length >= 2) for (const n of prefixIdx(t)) hit(n, at, 'dynamic'); }
-          else tryToken(t, at, aggressive);
+        const toks = tokensAt(p.text, at0 + p.off);
+        toks.forEach((tk, k) => {
+          const runsIntoInterp = k === toks.length - 1 && p.post && !/\s$/.test(p.text);
+          const runsOutOfInterp = k === 0 && p.pre && !/^\s/.test(p.text);
+          if (runsIntoInterp && tk.t.length >= 2) for (const n of prefixIdx(tk.t)) hit(n, tk.at, 'dynamic');
+          else if (runsOutOfInterp && tk.t.length >= 2) for (const n of suffixIdx(tk.t)) hit(n, tk.at, 'dynamic');
+          else if (!runsIntoInterp && !runsOutOfInterp) tryToken(tk.t, tk.at, aggressive);
         });
       }
     } else {
-      for (const t of body.split(/\s+/)) if (t) tryToken(t, at, aggressive);
-      if (aggressive) for (const t of body.split(/[^\w-]+/)) if (t) tryToken(t, at, false);
+      for (const tk of tokensAt(s.body, at0)) tryToken(tk.t, tk.at, aggressive);
+      if (aggressive) {
+        const re = /[\w-]+/g;
+        let m;
+        while ((m = re.exec(s.body))) tryToken(m[0], at0 + m.index, false);
+      }
     }
   }
-  // 2. CSS-module bindings: styles.fooBar
-  const imp = /(?:import\s+(?:\*\s+as\s+)?(\w+)\s+from\s*|(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*)['"][^'"]+\.(?:module\.)?(?:css|scss|sass|less|styl)['"]/g;
+
+  // unquoted attribute — valid HTML5 and common in .hbs/.ejs/.erb
+  const attr = /\bclass(?:Name)?\s*=\s*([A-Za-z_-][\w-]*)/g;
+  let a;
+  while ((a = attr.exec(src))) if (names.has(a[1])) hit(a[1], a.index, 'static');
+
+  // CSS-module bindings: styles.fooBar, and destructured off the same import
+  const imp = /(?:import\s+(?:\*\s+as\s+)?(\w+)\s+from\s*|import\s*\{\s*default\s+as\s+(\w+)\s*\}\s*from\s*|(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*)['"][^'"]+\.(?:module\.)?(?:css|scss|sass|less|styl)['"]/g;
   let b;
   while ((b = imp.exec(src))) {
-    const bind = b[1] || b[2];
+    const bind = b[1] || b[2] || b[3];
+    const resolve = (ident, at) => {
+      const raw = names.has(ident) ? ident : camelMap.get(ident);
+      if (raw) hit(raw, at, 'static');
+    };
     const use = new RegExp('\\b' + bind + '\\.([A-Za-z_$][\\w$]*)', 'g');
     let u;
-    while ((u = use.exec(src))) {
-      const raw = names.has(u[1]) ? u[1] : camelMap.get(u[1]);
-      if (raw) hit(raw, u.index, 'static');
+    while ((u = use.exec(src))) resolve(u[1], u.index);
+    const dest = new RegExp('(?:const|let|var)\\s*\\{([^}]*)\\}\\s*=\\s*' + bind + '\\b', 'g');
+    let dd;
+    while ((dd = dest.exec(src))) {
+      for (const piece of dd[1].split(',')) {
+        const nm = piece.split(':')[0].trim();
+        if (nm) resolve(nm, dd.index);
+      }
     }
   }
-  // 3. svelte class:foo directive
+
+  // svelte class:foo directive
   const dir = /\bclass:([\w-]+)/g;
   let d;
   while ((d = dir.exec(src))) if (names.has(d[1])) hit(d[1], d.index, 'static');
@@ -212,19 +417,43 @@ function scanTailwind(root) {
   return out;
 }
 
+// blank JS comments so a commented-out var() is not counted as a live use
+function sanitizeJs(src) {
+  const a = src.split('');
+  const n = src.length;
+  const wipe = (f, t) => { for (let k = f; k < t && k < n; k++) if (a[k] !== '\n') a[k] = ' '; };
+  let i = 0, prev = '';
+  while (i < n) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') { let j = i; while (j < n && src[j] !== '\n') j++; wipe(i, j); i = j; continue; }
+    if (c === '/' && src[i + 1] === '*') { let j = i + 2; while (j < n && !(src[j] === '*' && src[j + 1] === '/')) j++; j = Math.min(j + 2, n); wipe(i, j); i = j; continue; }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c; let j = i + 1;
+      while (j < n) { if (src[j] === '\\') { j += 2; continue; } if (src[j] === q) { j++; break; } if (q !== '`' && src[j] === '\n') break; j++; }
+      i = j; continue;
+    }
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return a.join('');
+}
+
 // ---------- CSS custom properties: the one index that works everywhere ----------
 function scanVars(root) {
   const defs = Object.create(null), uses = Object.create(null), theme = new Set();
   for (const f of walk(root)) {
     const ext = path.extname(f);
-    const isCss = CSS_EXT.has(ext);
+    const isCss = CSS_EXT.has(ext) || HTML_EXT.has(ext);
     if (!isCss && !SRC_EXT.has(ext)) continue;
-    const src = read(f);
-    if (src === null) continue;
-    const offs = lineOffsets(src);
+    const raw = read(f);
+    if (raw === null) continue;
+    const offs = lineOffsets(raw);
+    const src = isCss ? sanitizeCss(HTML_EXT.has(ext) ? onlyStyleBlocks(raw) : raw, ext !== '.css') : sanitizeJs(raw);
     const at = (i) => ({ file: f, line: lineAt(offs, i) });
     let m;
     if (isCss) {
+      const prop = /@property\s+(--[\w-]+)/g;      // @property declares a name before its block
+      while ((m = prop.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
       const d = /(--[\w-]+)\s*:/g;
       while ((m = d.exec(src))) (defs[m[1]] ||= []).push(at(m.index));
       // Tailwind v4: names declared in @theme are consumed by the framework itself to
@@ -248,39 +477,6 @@ function scanVars(root) {
     while ((m = u.exec(src))) (uses[m[1]] ||= []).push(at(m.index));
   }
   return { defs, uses, theme };
-}
-
-// ---------- rule spans: which lines does each rule occupy ----------
-function cssRuleSpans(file) {
-  let src = read(file);
-  if (src === null) return [];
-  if (HTML_EXT.has(path.extname(file))) src = onlyStyleBlocks(src);
-  src = src.replace(/\/\*[\s\S]*?\*\//g, blank);
-  if (path.extname(file) !== '.css') src = src.replace(/\/\/[^\n]*/g, blank);
-  src = src.replace(/"(?:\\.|[^"\\\n])*"/g, blank).replace(/'(?:\\.|[^'\\\n])*'/g, blank)
-           .replace(/@component\s+[\w-]+\s*;/g, blank)
-           .replace(/@(?:deprecated|owner|since)\s*\([^)]*\)/g, blank)
-           .replace(/@(?:public|private|internal)\b/g, blank);
-  const offs = lineOffsets(src);
-  const braces = [];
-  for (let k = 0; k < src.length; k++) if (src[k] === '{' || src[k] === '}') braces.push(k);
-  const stack = [], spans = [];
-  for (let n = 0; n < braces.length; n++) {
-    const k = braces[n];
-    if (src[k] === '{') { stack.push(n); continue; }
-    const on = stack.pop();
-    if (on === undefined) continue;
-    const depth = stack.length;
-    const open = braces[on];
-    const prev = on > 0 ? braces[on - 1] : -1;
-    const sel = src.slice(prev + 1, open);
-    if (/^\s*@/.test(sel)) continue;                       // @media prelude, not a rule
-    const classes = [...sel.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((c) => c[1]);
-    if (!classes.length) continue;
-    spans.push({ file, classes, depth, selector: sel.trim().replace(/\s+/g, ' '),
-      start: lineAt(offs, prev + 1 + sel.search(/\S/)), end: lineAt(offs, k) });
-  }
-  return spans;
 }
 
 // ---------- what did I just break? ----------
@@ -307,33 +503,68 @@ function changedCssLines(root, base) {
 }
 
 // ---------- rename, without breaking the dynamic call sites ----------
-function planRename(ix, from, to) {
-  const edits = new Map(), blocked = [];
-  const add = (file, line, before, after) => {
-    if (!edits.has(file)) edits.set(file, []);
-    edits.get(file).push({ line, before, after });
-  };
-  const bound = new RegExp('(?<![\\w-])' + from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w-])', 'g');
-  for (const d of ix.defs[from] || []) add(d.file, d.line, d.selector, null);
-  for (const u of ix.uses[from] || []) {
-    if (u.kind === 'dynamic') { blocked.push(u); continue; }
-    add(u.file, u.line, u.text, null);
+// A whole-file regex replace rewrote JS identifiers, comment prose and image paths —
+// `const btn =` became `const btn-primary =`, which does not parse. Only the exact
+// offsets of a class in a selector, or of a whole token inside a class string, are
+// edited; everything else in the file is left alone.
+function renameEdits(ix, file, from) {
+  const raw = read(file);
+  if (raw === null) return [];
+  const out = [];
+  const ext = path.extname(file);
+  if (CSS_EXT.has(ext) || HTML_EXT.has(ext)) {
+    const css = cssSource(file);                       // same length as raw: offsets align
+    if (css !== null) {
+      for (const r of lexCss(css, ext !== '.css')) {
+        for (const c of selectorClasses(r.rawSel)) {
+          if (c.name === from) out.push({ at: r.selStart + c.at, len: c.raw.length });
+        }
+      }
+    }
   }
-  const files = new Set([...(ix.defs[from] || []).map((d) => d.file), ...(ix.uses[from] || [])
-    .filter((u) => u.kind !== 'dynamic').map((u) => u.file)]);
+  if (SRC_EXT.has(ext)) {
+    const lexable = raw.replace(/(\w)'(\w)/g, (_, x, y) => x + ' ' + y);
+    for (const lit of lexStrings(lexable)) {
+      const re = /\S+/g;
+      let m;
+      while ((m = re.exec(lit.body))) {
+        if (m[0] === from) out.push({ at: lit.index + m.index, len: from.length });
+      }
+    }
+    const attr = /\bclass(?:Name)?\s*=\s*([A-Za-z_-][\w-]*)/g;
+    let a2;
+    while ((a2 = attr.exec(raw))) {
+      if (a2[1] === from) out.push({ at: a2.index + a2[0].length - a2[1].length, len: from.length });
+    }
+  }
+  return out.sort((x, y) => x.at - y.at).filter((e, k, arr) => k === 0 || e.at !== arr[k - 1].at);
+}
+
+function planRename(ix, from, to) {
+  const blocked = (ix.uses[from] || []).filter((u) => u.kind === 'dynamic');
+  const files = new Set([
+    ...(ix.defs[from] || []).map((d) => d.file),
+    ...(ix.uses[from] || []).filter((u) => u.kind !== 'dynamic').map((u) => u.file),
+  ]);
   const previews = [];
   for (const f of files) {
-    const src = read(f);
-    if (src === null) continue;
-    const next = src.replace(bound, to);
-    if (next === src) continue;
-    src.split('\n').forEach((l, i) => {
-      if (bound.test(l)) previews.push({ file: f, line: i + 1, before: l.trim(), after: l.replace(bound, to).trim() });
-      bound.lastIndex = 0;
-    });
+    const raw = read(f);
+    if (raw === null) continue;
+    const edits = renameEdits(ix, f, from);
+    if (!edits.length) continue;
+    const offs = lineOffsets(raw);
+    const lines = raw.split('\n');
+    let next = '', cursor = 0;
+    for (const e of edits) { next += raw.slice(cursor, e.at) + to; cursor = e.at + e.len; }
+    next += raw.slice(cursor);
+    for (const e of edits) {
+      const ln = lineAt(offs, e.at);
+      const before = (lines[ln - 1] || '').trim();
+      previews.push({ file: f, line: ln, before, after: before.replace(new RegExp('(?<![\\w-])' + from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w-])', 'g'), to) });
+    }
     previews.push({ file: f, write: next });
   }
-  return { previews, blocked };
+  return { previews, blocked, collision: !!(ix.defs[to] || ix.uses[to]) };
 }
 
 // ---------- extract: lift a component's own rules out of the monolith ----------
@@ -350,13 +581,16 @@ function planExtract(ix, componentFile) {
   // a class with an @media override must not be split across two files — the cascade
   // would then depend on import order, which is a bug nobody would trace back to us
   const overridden = new Set();
+  const sheetsOf = new Map();
   for (const sheet of sheets) for (const span of cssRuleSpans(sheet)) {
     if (span.depth > 0) for (const c of span.classes) overridden.add(c);
+    for (const c of span.classes) (sheetsOf.get(c) || sheetsOf.set(c, new Set()).get(c)).add(sheet);
   }
   for (const sheet of sheets) {
     for (const span of cssRuleSpans(sheet)) {
       if (!span.classes.some((c) => mine.includes(c))) continue;
       const why = span.depth > 0 ? 'nested in an at-rule'
+        : span.classes.some((c) => (sheetsOf.get(c) || new Set()).size > 1) ? 'defined in more than one stylesheet — moving it would flip the cascade'
         : span.classes.some((c) => overridden.has(c)) ? 'also overridden inside an at-rule — moving it would depend on import order'
         : span.classes.every((c) => exclusive.has(c)) ? null
         : 'shared with ' + [...new Set(span.classes.filter((c) => !exclusive.has(c))
@@ -374,13 +608,16 @@ function applyExtract(plan, outFile) {
   for (const m of plan.move) (bySheet.get(m.file) || bySheet.set(m.file, []).get(m.file)).push(m);
   const chunks = [];
   for (const [sheet, spans] of bySheet) {
-    const lines = fs.readFileSync(sheet, 'utf8').split('\n');
-    const drop = new Set();
-    for (const s2 of spans.sort((a, b) => a.start - b.start)) {
-      chunks.push(lines.slice(s2.start - 1, s2.end).join('\n'));
-      for (let i = s2.start; i <= s2.end; i++) drop.add(i);
+    const src = fs.readFileSync(sheet, 'utf8');
+    // character offsets, not lines: `.a {} .b {}` on one line must not lose .b, and a
+    // rule's closing brace must never be cut away from the rule that keeps it
+    let kept = '', cursor = 0;
+    for (const s2 of spans.slice().sort((a, b) => a.from - b.from)) {
+      chunks.push(src.slice(s2.from, s2.to));
+      kept += src.slice(cursor, s2.from);
+      cursor = s2.to;
     }
-    const kept = lines.filter((_, i) => !drop.has(i + 1)).join('\n').replace(/\n{3,}/g, '\n\n');
+    kept += src.slice(cursor);
     fs.writeFileSync(sheet, kept);
   }
   fs.writeFileSync(outFile, chunks.join('\n') + '\n');
@@ -399,7 +636,8 @@ function buildIndex(root) {
   const sorted = [...names].sort();
   const camelMap = new Map(sorted.map((n) => [camel(n), n]));
   const prefixIdx = (p) => sorted.filter((n) => n.length > p.length && n.startsWith(p));
-  for (const f of srcFiles) parseSrc(f, names, prefixIdx, uses, camelMap);
+  const suffixIdx = (p) => sorted.filter((n) => n.length > p.length && n.endsWith(p));
+  for (const f of srcFiles) parseSrc(f, names, prefixIdx, suffixIdx, uses, camelMap);
   return { defs, uses, cssFiles, srcFiles, root, skipped };
 }
 
@@ -570,7 +808,7 @@ function main(argv) {
   if (args.includes('--rename')) {
     const [from, to] = args.filter((a) => !a.startsWith('--')).map((a) => a.replace(/^\./, ''));
     if (!from || !to) { console.error('usage: whouses --rename .old-name .new-name [--write]'); process.exitCode = 1; return; }
-    const { previews, blocked } = planRename(ix, from, to);
+    const { previews, blocked, collision } = planRename(ix, from, to);
     const lines = previews.filter((p) => !p.write);
     if (!lines.length) { console.log(C.y('.' + from + ' not found')); process.exitCode = 1; return; }
     console.log(C.b('.' + from) + ' → ' + C.b('.' + to) + C.dim('  ' + lines.length + ' line(s) in ' + new Set(lines.map((l) => l.file)).size + ' file(s)\n'));
@@ -579,6 +817,7 @@ function main(argv) {
       console.log(C.r('  - ' + l.before.slice(0, 110)));
       console.log(C.g('  + ' + l.after.slice(0, 110)));
     }
+    if (collision) console.log(C.y('\nnote: .' + to + ' already exists — the two rules will merge and .' + from + ' may be shadowed.'));
     if (blocked.length) {
       console.log(C.y('\n' + blocked.length + ' site(s) build this class at runtime — NOT renamed, fix these by hand:'));
       for (const b of blocked) console.log('  ' + rel(root, b.file) + ':' + b.line + C.dim('  ' + b.text.slice(0, 90)));
@@ -610,6 +849,14 @@ function main(argv) {
       return;
     }
     if (fs.existsSync(hook)) {
+      const shebang = (fs.readFileSync(hook, 'utf8').split('\n')[0] || '');
+      if (!/^#!.*\b(sh|bash|zsh|dash)\b/.test(shebang)) {
+        // appending shell into a python/node hook breaks every commit in the repo
+        console.error(C.r('your pre-commit hook is not a shell script') + C.dim(' (' + (shebang || 'no shebang') + ')'));
+        console.error(C.dim('  add this line to it yourself:  ') + C.b('npx whouses --diff HEAD || true'));
+        process.exitCode = 1;
+        return;
+      }
       fs.appendFileSync(hook, '\n' + body.split('\n').slice(1).join('\n'));   // keep whatever is already there
       console.log(C.g('appended to your existing ') + rel(root, hook));
     } else {
@@ -627,6 +874,12 @@ function main(argv) {
     if (!plan.move.length) console.log(C.y('  nothing can move — every rule it uses is shared or nested'));
     for (const m of plan.move) console.log(C.g('  move  ') + m.selector.slice(0, 70) + C.dim('  ' + rel(root, m.file) + ':' + m.start + (m.end > m.start ? '-' + m.end : '')));
     for (const s2 of plan.stay) console.log(C.y('  stay  ') + s2.selector.slice(0, 70) + C.dim('  ' + s2.why));
+    if (args.includes('--write') && plan.move.length && fs.existsSync(out) && !args.includes('--force')) {
+      console.error(C.r('\nrefusing to write: ') + rel(root, out) + ' already exists.');
+      console.error(C.dim('  it would be replaced, not merged. move it aside, or pass --force.'));
+      process.exitCode = 1;
+      return;
+    }
     if (args.includes('--write') && plan.move.length) {
       applyExtract(plan, out);
       console.log(C.g('\nwritten ') + rel(root, out) + C.dim(' — ' + plan.move.length + ' rule(s) moved out of the monolith'));
@@ -663,5 +916,5 @@ indexed ${ix.cssFiles.length} stylesheet(s), ${ix.srcFiles.length} source file(s
   reportClass(ix, target.replace(/^\./, ''));
 }
 
-module.exports = { buildIndex, parseCss, parseSrc, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
+module.exports = { buildIndex, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
 if (require.main === module) main(process.argv);
