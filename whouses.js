@@ -4,8 +4,13 @@
 const fs = require('fs');
 const path = require('path');
 
+// build output and vendored trees are not your source. An Electron project here shipped
+// a 9.8MB LICENSES.chromium.html under release/, which was read twice and dominated
+// both the runtime and the memory of every command.
 const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.nuxt',
-  '.svelte-kit', 'coverage', '.cache', 'vendor', '__pycache__', '.turbo']);
+  '.svelte-kit', 'coverage', '.cache', 'vendor', '__pycache__', '.turbo', 'release',
+  'target', '.output', '.vercel', '.netlify', '.parcel-cache', 'bower_components',
+  'Pods', '.venv', 'venv', '.gradle', 'vendor.bundle', '.terraform']);
 // CSS also lives inside <style> blocks: plain HTML pages, and every Vue/Svelte/Astro component
 const HTML_EXT = new Set(['.html', '.htm', '.vue', '.svelte', '.astro']);
 const onlyStyleBlocks = (src) => {

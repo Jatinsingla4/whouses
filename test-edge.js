@@ -226,5 +226,17 @@ ok('an unreadable or oversized file is reported, never silently dropped', () => 
   assert.match(run(['--root', path.join(root, 'e4'), '--orphans']), /skipped 1 file/);
 });
 
+ok('build output and vendored trees are not scanned as source', () => {
+  w('e5/src/a.css', '.live { color: red }');
+  w('e5/src/A.jsx', '<div className="live"/>');
+  for (const d of ['dist', 'build', 'release', 'target', '.next', 'out', 'coverage', 'Pods', 'bower_components', '.vercel']) {
+    w(`e5/${d}/vendor.css`, '.build-artifact { color: blue }');
+    w(`e5/${d}/LICENSES.html`, '<style>.license-junk{color:green}</style>');
+  }
+  const out = run(['--root', path.join(root, 'e5'), '--orphans']);
+  assert.match(out, /^0 orphan/, out.slice(0, 200));
+  assert.ok(!/build-artifact|license-junk/.test(out), 'build output leaked into the index: ' + out);
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — ' + n + ' edge cases, all previously shipped bugs');
