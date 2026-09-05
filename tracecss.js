@@ -217,7 +217,15 @@ function run(root, { write, doAnnotate, quiet, force }) {
 }
 
 function main() {
-  const [cmd, dirArg] = process.argv.slice(2).filter((a) => !a.startsWith('-'));
+  const argv = process.argv.slice(2);
+  if (argv.includes('--version') || argv.includes('-v')) {
+    try { return console.log(require(path.join(__dirname, 'package.json')).version); } catch { return console.log('0.0.0'); }
+  }
+  const [cmd, dirArg] = argv.filter((a) => !a.startsWith('-'));
+  if (cmd && !['build', 'check', 'annotate', 'watch'].includes(cmd)) {
+    console.error(red('unknown command: ') + cmd + dim('  (build | check | annotate | watch)'));
+    return process.exit(2);
+  }
   const root = path.resolve(dirArg || '.');
   const force = process.argv.includes('--force');
   if (cmd === 'build') return process.exit(run(root, { write: true, doAnnotate: true, force }));

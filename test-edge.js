@@ -238,5 +238,30 @@ ok('build output and vendored trees are not scanned as source', () => {
   assert.ok(!/build-artifact|license-junk/.test(out), 'build output leaked into the index: ' + out);
 });
 
+// ---------- the first things a stranger types ----------
+ok('--version prints a version, not the help screen', () => {
+  assert.match(run(['--version']).trim(), /^\d+\.\d+\.\d+$/);
+  assert.match(run(['-v']).trim(), /^\d+\.\d+\.\d+$/);
+});
+ok('--help and -h show help instead of being read as a class name', () => {
+  for (const f of ['--help', '-h']) {
+    const out = run([f]);
+    assert.match(out, /reverse index for CSS/, f + ' => ' + out.slice(0, 80));
+    assert.ok(!/not defined in any stylesheet/.test(out), f + ' was parsed as a class name');
+  }
+});
+ok('a mistyped flag is an error, not a silent help screen', () => {
+  const r = spawnSync('node', [CLI, '--orphan'], { encoding: 'utf8' });
+  const out = (r.stdout || '') + (r.stderr || '');
+  assert.match(out, /unknown option: --orphan/, out.slice(0, 120));
+  assert.match(out, /did you mean.*--orphans/, out);
+  assert.notStrictEqual(r.status, 0, 'a typo must not exit 0');
+});
+ok('tracecss rejects an unknown command', () => {
+  const r = spawnSync('node', [TC, 'bogus'], { encoding: 'utf8' });
+  assert.match((r.stdout || '') + (r.stderr || ''), /unknown command: bogus/);
+  assert.notStrictEqual(r.status, 0);
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — ' + n + ' edge cases, all previously shipped bugs');

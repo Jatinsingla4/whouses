@@ -748,12 +748,55 @@ function reportFile(ix, srcFile) {
   if (!found.length) console.log(C.dim('none'));
 }
 
+function helpText(ix) {
+  return `whouses — reverse index for CSS
+
+  whouses .btn-primary        who uses this class (files + line numbers)
+  whouses src/theme.css       blast radius of a stylesheet, class by class
+  whouses --file Button.tsx   which classes this component depends on
+  whouses --diff              what did I just break? blast radius of your CSS edits
+  whouses --rename .a .b      rename everywhere, refuse if a runtime site would break
+  whouses --extract C.jsx     lift a component's own rules out of a giant stylesheet
+  whouses --orphans           defined but never used — safe to delete
+  whouses --dynamic           only matched through \${interpolation} — check by hand
+  whouses --tailwind          classes Tailwind's scanner will silently drop
+  whouses --vars              CSS custom properties, traced into your JS too
+  whouses --install-hook      print the blast radius on every commit, automatically
+  whouses --json              machine-readable index
+
+  --root <dir>                scan somewhere else (default: cwd)
+  --write                     apply --rename / --extract (both are dry runs without it)
+  --force                     override a refusal, once you understand why it refused
+  --version                   print the version
+
+exit codes: 0 ok · 1 something to act on (orphans, errors) · 2 bad usage` +
+    (ix ? `\n\nindexed ${ix.cssFiles.length} stylesheet(s), ${ix.srcFiles.length} source file(s), ${Object.keys(ix.defs).length} classes` : '');
+}
+
+const VERSION = (() => { try { return require(path.join(__dirname, 'package.json')).version; } catch { return '0.0.0'; } })();
+const FLAGS = new Set(['--orphans', '--dynamic', '--tailwind', '--vars', '--diff', '--file',
+  '--rename', '--extract', '--install-hook', '--json', '--write', '--force', '--root',
+  '--help', '-h', '--version', '-v']);
+
 function main(argv) {
   const args = argv.slice(2);
+  if (args.includes('--version') || args.includes('-v')) return console.log(VERSION);
+  if (args.includes('--help') || args.includes('-h')) return console.log(helpText(null));
+  // a typo like --orphan used to print help and exit 0, so it looked like it had run
+  const unknown = args.filter((a) => a.startsWith('-') && !FLAGS.has(a));
+  if (unknown.length) {
+    console.error('unknown option: ' + unknown.join(' '));
+    const stem = unknown[0].replace(/^-+/, '').slice(0, 4);
+    const near = [...FLAGS].filter((f) => f.startsWith('--') && stem && f.includes(stem));
+    if (near.length) console.error('  did you mean  ' + near.join('  '));
+    console.error('  run  whouses --help  for the full list');
+    process.exitCode = 2;
+    return;
+  }
   const opt = (k, d) => { const i = args.indexOf(k); if (i < 0) return d; const v = args[i + 1]; args.splice(i, 2); return v; };
   const root = path.resolve(opt('--root', '.'));
   const json = args.includes('--json');
-  const target = args.filter((a) => !a.startsWith('--'))[0];
+  const target = args.filter((a) => !a.startsWith('-'))[0];
   const ix = buildIndex(root);
   // a file the tool could not read is a hole in the answer — never hide it
   if (ix.skipped.length) {
@@ -943,23 +986,7 @@ function main(argv) {
   }
   if (args.includes('--file')) return reportFile(ix, target);
   if (!target) {
-    console.log(`whouses — reverse index for CSS
-
-  whouses .btn-primary        who uses this class (files + line numbers)
-  whouses src/theme.css       blast radius of a stylesheet, class by class
-  whouses --file Button.tsx   which classes this component depends on
-  whouses --diff              what did I just break? blast radius of your CSS edits
-  whouses --rename .a .b      rename everywhere, refuse if a runtime site would break
-  whouses --orphans           defined but never used — safe to delete
-  whouses --dynamic           only matched through \${interpolation} — check by hand
-  whouses --tailwind          classes Tailwind's scanner will silently drop
-  whouses --vars              CSS custom properties, traced into your JS too
-  whouses --extract C.jsx     lift a component's own rules out of a giant stylesheet
-  whouses --install-hook      print the blast radius on every commit, automatically
-  whouses --json              machine-readable index
-  --root <dir>                scan somewhere else (default: cwd)
-
-indexed ${ix.cssFiles.length} stylesheet(s), ${ix.srcFiles.length} source file(s), ${Object.keys(ix.defs).length} classes`);
+    console.log(helpText(ix));
     return;
   }
   const ext = path.extname(target);
