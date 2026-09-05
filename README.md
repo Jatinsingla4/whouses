@@ -40,12 +40,22 @@ whouses builds the index CSS never had: **class → every place that reaches it.
 ```bash
 npx whouses .btn-primary        # who uses this class — files and line numbers
 npx whouses styles/app.css      # blast radius of a whole stylesheet, class by class
+npx whouses --diff              # what did I just break? blast radius of your CSS edits
 npx whouses --file Card.tsx     # which classes this component depends on
 npx whouses --orphans           # defined, used by nobody — safe to delete
 npx whouses --dynamic           # only reachable through ${interpolation} — check by hand
+npx whouses --tailwind          # classes Tailwind's scanner silently drops
+npx whouses --vars              # CSS custom properties, traced into your JS too
+npx whouses --rename .a .b      # rename everywhere; refuses to half-apply
+npx whouses --extract C.jsx     # lift a component's rules out of a giant stylesheet
+npx whouses --install-hook      # print the blast radius on every commit, automatically
 npx whouses --json              # the full index, for your own tooling
 npx whouses --root packages/ui  # scan somewhere other than cwd
 ```
+
+`--rename` and `--extract` are dry runs until you add `--write`. Everything else only
+reads. `--force` exists on the two commands that can refuse, and you should need it
+rarely — see below.
 
 ### Before you edit a stylesheet
 
@@ -92,26 +102,6 @@ npx whouses --dynamic    # always check this before acting on --orphans
 
 The bias is deliberate: a false positive wastes a second, a false negative ships a bug.
 
-## How it reads your code
-
-Not with regexes over raw text. Stylesheets go through a character-level lexer that
-tracks comments, strings and `url()`, so `content: "/*"`, `url(https://x)`, a
-`;`-terminated `@import` and nested rules all parse correctly — and every rule carries
-exact character offsets, so `--extract` and `--rename` edit those offsets and nothing else.
-
-Source files go through a small JS lexer, so a `//` comment, a regex literal, or an
-apostrophe in `<p>it's here</p>` can never be mistaken for a string and hide the class
-next to it. Missing a usage is the one failure this tool must not have: it is what makes
-a developer delete live CSS.
-
-Write commands refuse rather than guess. `--extract` will not overwrite an existing
-component stylesheet, will not move a class defined in two sheets (the cascade would
-flip), and will not split a class from its `@media` override. `--rename` will not
-half-apply. `tracecss build` will not replace a `.css` it did not generate.
-
-## Requirements
-
-Node 16+. Zero dependencies.
 
 
 ---
@@ -207,26 +197,6 @@ npx tracecss watch src/      # keep it all fresh while you code
 | CSS Modules | n/a | scoping only, no visibility | no | rewrite every import |
 | **tracecss** | **yes, and says so** | **`@private` at build time** | **yes, in the file** | **one rename** |
 
-## How it reads your code
-
-Not with regexes over raw text. Stylesheets go through a character-level lexer that
-tracks comments, strings and `url()`, so `content: "/*"`, `url(https://x)`, a
-`;`-terminated `@import` and nested rules all parse correctly — and every rule carries
-exact character offsets, so `--extract` and `--rename` edit those offsets and nothing else.
-
-Source files go through a small JS lexer, so a `//` comment, a regex literal, or an
-apostrophe in `<p>it's here</p>` can never be mistaken for a string and hide the class
-next to it. Missing a usage is the one failure this tool must not have: it is what makes
-a developer delete live CSS.
-
-Write commands refuse rather than guess. `--extract` will not overwrite an existing
-component stylesheet, will not move a class defined in two sheets (the cascade would
-flip), and will not split a class from its `@media` override. `--rename` will not
-half-apply. `tracecss build` will not replace a `.css` it did not generate.
-
-## Requirements
-
-Node 16+. Zero dependencies.
 
 ---
 
@@ -391,6 +361,56 @@ Multi-line rules move whole, the origin stylesheet is left with balanced braces,
 verified by tests. Then it prints the one import line for you to paste.
 
 Run it component by component and a monolith becomes a modular codebase, without a rewrite.
+
+
+---
+
+# How it reads your code
+
+Not with regexes over raw text. Stylesheets go through a character-level lexer that tracks
+comments, strings and `url()`, so `content: "/*"`, `url(https://x)`, a `;`-terminated
+`@import` and nested rules all parse correctly — and every rule carries exact character
+offsets, so `--extract` and `--rename` edit those offsets and nothing else.
+
+Source files go through a small JS lexer, so a `//` comment, a regex literal, or an
+apostrophe in `<p>it's here</p>` can never be mistaken for a string and hide the class next
+to it. **Missing a usage is the one failure this tool must not have** — it is what makes a
+developer delete live CSS.
+
+## Write commands refuse rather than guess
+
+| It stops when | Because |
+|---|---|
+| `--rename` finds a runtime-built call site | A half-applied rename is a silently broken app |
+| `--extract` would overwrite an existing `Component.css` | That file may be hand-written |
+| `--extract` finds the class in two stylesheets | Moving it would flip the cascade |
+| `--extract` finds an `@media` override | Splitting the class across files makes it import-order dependent |
+| `tracecss build` finds a `.css` it did not generate | It may be 400 lines of someone's work |
+| `--install-hook` finds a non-shell `pre-commit` | Appending `sh` into a Python hook blocks every commit |
+
+Each prints what it found and what to do. `--force` overrides the two that are sometimes
+legitimately wrong; the rest you fix by hand.
+
+## Big repos, small repos
+
+Measured, not estimated:
+
+| | time | memory |
+|---|---|---|
+| Empty folder, or one file | instant | 35 MB |
+| A real 912-class Next.js app | 0.2s | 59 MB |
+| 10,000 classes across 3,000 components | 0.7s | 71 MB |
+| A single 1,000,000-line stylesheet | 3.6s | 526 MB |
+| A 3.7 MB stylesheet on one line | 2.5s | 238 MB |
+
+`node_modules`, `dist`, `build`, `release`, `target`, `.next`, `Pods`, `coverage` and the
+other usual build and vendor trees are skipped. A file that genuinely cannot be read — over
+32 MB, binary, or permission-denied — is **reported on every command**, never dropped in
+silence, because a silent skip is a hole in the answer.
+
+## Requirements
+
+Node 16+. Zero dependencies.
 
 ## License
 
