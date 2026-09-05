@@ -9,6 +9,7 @@ const { execFileSync, spawnSync } = require('child_process');
 const CLI = path.join(__dirname, 'whouses.js');
 const TC = path.join(__dirname, 'tracecss.js');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-'));
+const rel = (f) => path.relative(root, f).split(path.sep).join('/');   // windows gives backslashes
 const w = (p, c) => { const f = path.join(root, p); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, c); return f; };
 const run = (args) => { const r = spawnSync('node', [CLI, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); return (r.stdout || '') + (r.stderr || ''); };
 const defsOf = (f) => { const d = {}; W.parseCss(f, d); return d; };

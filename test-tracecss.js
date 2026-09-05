@@ -5,6 +5,7 @@ const { parseTcss, compile, annotate, check, sheetsIn } = require('./tracecss');
 const { buildIndex } = require('./whouses');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tracecss-'));
+const rel = (f) => path.relative(root, f).split(path.sep).join('/');   // windows gives backslashes
 const w = (p, c) => { fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true }); fs.writeFileSync(path.join(root, p), c); return path.join(root, p); };
 
 // --- the superset promise: any plain CSS is already valid tracecss ---

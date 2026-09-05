@@ -6,6 +6,7 @@ const path = require('path');
 const { buildIndex, scanTailwind, scanVars, cssRuleSpans, planRename, planExtract, applyExtract } = require('./whouses');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whouses-'));
+const rel = (f) => path.relative(root, f).split(path.sep).join('/');   // windows gives backslashes
 const w = (p, c) => { fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true }); fs.writeFileSync(path.join(root, p), c); return path.join(root, p); };
 
 w('styles/app.css', `
@@ -27,9 +28,9 @@ w('src/Note.vue', `<template><p :class="{ card: true }">hi</p></template>`);
 w('src/prose.md', `The card game is fun.`);
 
 const ix = buildIndex(root);
-const files = (n) => new Set(ix.usedBy(n).map((u) => path.relative(root, u.file))).size;
+const files = (n) => new Set(ix.usedBy(n).map((u) => rel(u.file))).size;
 const kinds = (n) => ix.usedBy(n).map((u) => u.kind);
-const at = (n) => ix.usedBy(n).map((u) => path.relative(root, u.file) + ':' + u.line).sort();
+const at = (n) => ix.usedBy(n).map((u) => rel(u.file) + ':' + u.line).sort();
 
 // definitions
 assert.ok(ix.defs['btn'], 'plain class defined');
