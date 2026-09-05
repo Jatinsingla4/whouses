@@ -4,13 +4,13 @@
 const assert = require('assert');
 const fs = require('fs'), os = require('os'), path = require('path');
 const W = require('./whouses');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const CLI = path.join(__dirname, 'whouses.js');
 const TC = path.join(__dirname, 'tracecss.js');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-'));
 const w = (p, c) => { const f = path.join(root, p); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, c); return f; };
-const run = (args) => { try { return execFileSync('node', [CLI, ...args], { encoding: 'utf8' }); } catch (e) { return (e.stdout || '') + (e.stderr || ''); } };
+const run = (args) => { const r = spawnSync('node', [CLI, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); return (r.stdout || '') + (r.stderr || ''); };
 const defsOf = (f) => { const d = {}; W.parseCss(f, d); return d; };
 const balanced = (t) => [...t].filter((c) => c === '{').length === [...t].filter((c) => c === '}').length;
 let n = 0;
@@ -162,7 +162,7 @@ ok('--install-hook refuses to append shell into a non-shell hook', () => {
 });
 
 // ---------- tracecss ----------
-const tc = (dir) => { try { return execFileSync('node', [TC, 'build', path.join(root, dir)], { encoding: 'utf8' }); } catch (e) { return (e.stdout || '') + (e.stderr || ''); } };
+const tc = (dir) => { const r = spawnSync('node', [TC, 'build', path.join(root, dir)], { encoding: 'utf8' }); return (r.stdout || '') + (r.stderr || ''); };
 ok('a ) inside a @deprecated message does not destroy the stylesheet', () => {
   w('d1/S.tcss', '@deprecated("use .btn-danger (new)") .btn-delete { color: red; }\n.keep { color: blue }');
   tc('d1');
@@ -183,6 +183,47 @@ ok('tracecss build refuses to destroy a hand-written .css', () => {
   const hand = w('d3/Doc.css', '/* HAND-WRITTEN 400 lines */\n.legacy { background: red }');
   assert.match(tc('d3'), /refusing to overwrite/);
   assert.match(fs.readFileSync(hand, 'utf8'), /HAND-WRITTEN/);
+});
+
+// ---------- scale: a project can be one file or a million lines ----------
+ok('an empty project says so instead of crashing', () => {
+  fs.mkdirSync(path.join(root, 'e0'), { recursive: true });
+  assert.match(run(['--root', path.join(root, 'e0'), '--orphans']), /no CSS classes found/);
+});
+ok('200-deep nesting does not blow the stack', () => {
+  w('e1/d.scss', '.l0 {\n'.replace('.l0', '.l0') + Array.from({ length: 199 }, (_, i) => `.l${i + 1} {`).join('\n') + '\ncolor: red;\n' + '}\n'.repeat(200));
+  w('e1/A.jsx', '<div className="l0 l199"/>');
+  const out = run(['--root', path.join(root, 'e1'), '--orphans']);
+  assert.ok(!/Error|Maximum call stack/.test(out), out);
+});
+ok('a broad dynamic prefix does not explode into a per-class row', () => {
+  // 4000 classes and 300 files all matched by one `u-${k}` — the old index stored a
+  // row per class per file, which was 1.2M rows here and 30M on a real design system
+  let css = '';
+  for (let i = 0; i < 4000; i++) css += `.u-${i}{margin:${i % 9}px}\n`;
+  w('e2/src/all.css', css);
+  for (let i = 0; i < 300; i++) w(`e2/src/C${i}.jsx`, 'export default ({k}) => <div className={`u-${k}`}/>;');
+  const t0 = Date.now();
+  const out = run(['--root', path.join(root, 'e2'), '--orphans']);
+  const ms = Date.now() - t0;
+  assert.match(out, /^0 orphan/, out.slice(0, 200));
+  assert.ok(ms < 30000, 'took ' + ms + 'ms — the fan-out regressed');
+});
+ok('a stylesheet on one very long line is parsed, not skipped', () => {
+  let css = '';
+  for (let i = 0; i < 20000; i++) css += `.x${i}{margin:${i % 9}px}`;
+  w('e3/one.css', css);
+  w('e3/A.jsx', '<div className="x1 x2"/>');
+  const out = run(['--root', path.join(root, 'e3'), '--orphans']);
+  assert.match(out, /^19998 orphan/, out.slice(0, 120));
+});
+ok('an unreadable or oversized file is reported, never silently dropped', () => {
+  w('e4/a.css', '.k { color: red }');
+  w('e4/A.jsx', '<div className="k"/>');
+  const big = path.join(root, 'e4/huge.css');
+  fs.writeFileSync(big, '.z{margin:0}\n'.repeat(10));
+  fs.writeFileSync(big, Buffer.alloc(2, 0));            // a binary file
+  assert.match(run(['--root', path.join(root, 'e4'), '--orphans']), /skipped 1 file/);
 });
 
 fs.rmSync(root, { recursive: true, force: true });

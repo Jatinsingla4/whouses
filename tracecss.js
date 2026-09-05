@@ -76,7 +76,7 @@ function check(ix, sheets) {
   for (const sheet of sheets) {
     for (const r of sheet.rules) {
       for (const cls of r.classes) {
-        const uses = (ix.uses[cls] || []).filter((u) => path.extname(u.file) !== '.tcss');
+        const uses = ix.usedBy(cls).filter((u) => path.extname(u.file) !== '.tcss');
         // a dynamic hit is a strong guess, not a fact — never fail a build on a guess
         if (r.access === 'private') {
           for (const u of uses) {
@@ -113,7 +113,7 @@ function annotate(ix, sheet) {
   const insert = new Map();
   for (const r of reparsed.rules) {
     const uses = [];
-    for (const cls of r.classes) for (const u of ix.uses[cls] || []) {
+    for (const cls of r.classes) for (const u of ix.usedBy(cls)) {
       if (path.extname(u.file) !== '.tcss') uses.push(u);
     }
     const files = new Set(uses.map((u) => u.file));

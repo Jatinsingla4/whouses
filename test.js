@@ -27,9 +27,9 @@ w('src/Note.vue', `<template><p :class="{ card: true }">hi</p></template>`);
 w('src/prose.md', `The card game is fun.`);
 
 const ix = buildIndex(root);
-const files = (n) => new Set((ix.uses[n] || []).map((u) => path.relative(root, u.file))).size;
-const kinds = (n) => (ix.uses[n] || []).map((u) => u.kind);
-const at = (n) => (ix.uses[n] || []).map((u) => path.relative(root, u.file) + ':' + u.line).sort();
+const files = (n) => new Set(ix.usedBy(n).map((u) => path.relative(root, u.file))).size;
+const kinds = (n) => ix.usedBy(n).map((u) => u.kind);
+const at = (n) => ix.usedBy(n).map((u) => path.relative(root, u.file) + ':' + u.line).sort();
 
 // definitions
 assert.ok(ix.defs['btn'], 'plain class defined');
@@ -49,7 +49,7 @@ assert.ok(at('btn-danger').includes('src/legacy.js:1'), 'querySelector string co
 // template literal: complete token static, interpolated token dynamic
 assert.ok(kinds('card--flat').includes('static'), 'quoted token inside template is static');
 // `btn-${kind}` flags every .btn-* class as a dynamic candidate
-const fromCard = (n) => (ix.uses[n] || []).filter((u) => u.file.endsWith('Card.tsx'));
+const fromCard = (n) => ix.usedBy(n).filter((u) => u.file.endsWith('Card.tsx'));
 assert.deepStrictEqual(fromCard('btn-primary').map((u) => u.kind), ['dynamic']);
 assert.deepStrictEqual(fromCard('btn-danger').map((u) => u.kind), ['dynamic']);
 assert.strictEqual(fromCard('btn').length, 0, 'prefix must be strictly longer, .btn itself not flagged');
@@ -61,13 +61,13 @@ assert.deepStrictEqual(at('wrapTight'), ['src/Widget.tsx:2']);
 assert.deepStrictEqual(at('legacy-name'), ['src/Widget.tsx:2'], 'styles.legacyName maps back to .legacy-name');
 
 // vue object syntax
-assert.ok((ix.uses['card'] || []).some((u) => u.file.endsWith('Note.vue')), 'vue :class object key');
+assert.ok(ix.usedBy('card').some((u) => u.file.endsWith('Note.vue')), 'vue :class object key');
 
 // prose must NOT count as usage
-assert.ok(!(ix.uses['card'] || []).some((u) => u.file.endsWith('prose.md')), 'markdown prose is not a usage');
+assert.ok(!ix.usedBy('card').some((u) => u.file.endsWith('prose.md')), 'markdown prose is not a usage');
 
 // orphans
-assert.ok(!ix.uses['nobody-uses-me'], 'orphan detected');
+assert.ok(!ix.isUsed('nobody-uses-me'), 'orphan detected');
 
 // ---- Tailwind: flag fragments, never flag whole class names ----
 w('src/Tw.jsx', [
@@ -194,8 +194,8 @@ assert.ok(ix5.defs['sfc-card'], 'class defined inside a Vue <style> block is fou
 assert.strictEqual(ix5.defs['sfc-card'][0].line, 5, 'line number is the real line in the .vue file');
 assert.ok(ix5.defs['page-hero'], 'class defined inside an HTML <style> block is found');
 assert.strictEqual(ix5.defs['page-hero'][0].line, 2);
-assert.ok((ix5.uses['sfc-card'] || []).length, 'the template markup counts as a usage');
-assert.ok(!ix5.uses['sfc-dead'], 'unused class in a <style> block is still an orphan');
+assert.ok(ix5.usedBy('sfc-card').length, 'the template markup counts as a usage');
+assert.ok(!ix5.isUsed('sfc-dead'), 'unused class in a <style> block is still an orphan');
 assert.ok(!ix5.defs['template'] && !ix5.defs['div'], 'markup outside <style> is never parsed as CSS');
 
 // ---- :global() names come from libraries and are never "dead" ----

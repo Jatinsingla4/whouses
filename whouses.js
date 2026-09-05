@@ -31,7 +31,9 @@ const camel = (s) => s.replace(/-+([a-z0-9])/gi, (_, c) => c.toUpperCase());
 const lineOffsets = (s) => { const o = [0]; for (let i = 0; i < s.length; i++) if (s[i] === '\n') o.push(i + 1); return o; };
 const lineAt = (o, i) => { let lo = 0, hi = o.length - 1; while (lo < hi) { const m = (lo + hi + 1) >> 1; o[m] <= i ? lo = m : hi = m - 1; } return lo + 1; };
 
-const MAX_BYTES = 2 * 1024 * 1024;      // a 5MB minified bundle has nothing to tell us
+// a 10MB stylesheet lexes in about a second, so the old 2MB cap was silently skipping
+// files the tool handles fine. Anything past this is reported, never skipped in silence.
+const MAX_BYTES = 32 * 1024 * 1024;
 const skipped = [];
 function read(file) {
   try {
@@ -290,7 +292,7 @@ const tokensAt = (text, base) => {
   return out;
 };
 
-function parseSrc(file, names, prefixIdx, suffixIdx, uses, camelMap) {
+function parseSrc(file, names, uses, camelMap, dyn) {
   const src = read(file);
   if (src === null) return;
   const offs = lineOffsets(src);
@@ -330,8 +332,19 @@ function parseSrc(file, names, prefixIdx, suffixIdx, uses, camelMap) {
         toks.forEach((tk, k) => {
           const runsIntoInterp = k === toks.length - 1 && p.post && !/\s$/.test(p.text);
           const runsOutOfInterp = k === 0 && p.pre && !/^\s/.test(p.text);
-          if (runsIntoInterp && tk.t.length >= 2) for (const n of prefixIdx(tk.t)) hit(n, tk.at, 'dynamic');
-          else if (runsOutOfInterp && tk.t.length >= 2) for (const n of suffixIdx(tk.t)) hit(n, tk.at, 'dynamic');
+          // record the fragment once, not one row per class it could match: `u-${k}`
+          // against 10k classes used to produce a row per class PER FILE
+          const frag = (kind) => {
+            const key = kind + ' ' + tk.t;
+            const line = lineAt(offs, tk.at);
+            if (!dyn.has(key)) dyn.set(key, { kind, frag: tk.t, sites: [] });
+            const e = dyn.get(key);
+            if (!e.sites.some((x) => x.file === file && x.line === line)) {
+              e.sites.push({ file, line, text: (lines[line - 1] || '').trim().slice(0, 120) });
+            }
+          };
+          if (runsIntoInterp && tk.t.length >= 2) frag('prefix');
+          else if (runsOutOfInterp && tk.t.length >= 2) frag('suffix');
           else if (!runsIntoInterp && !runsOutOfInterp) tryToken(tk.t, tk.at, aggressive);
         });
       }
@@ -541,10 +554,10 @@ function renameEdits(ix, file, from) {
 }
 
 function planRename(ix, from, to) {
-  const blocked = (ix.uses[from] || []).filter((u) => u.kind === 'dynamic');
+  const blocked = ix.usedBy(from).filter((u) => u.kind === 'dynamic');
   const files = new Set([
     ...(ix.defs[from] || []).map((d) => d.file),
-    ...(ix.uses[from] || []).filter((u) => u.kind !== 'dynamic').map((u) => u.file),
+    ...ix.usedBy(from).filter((u) => u.kind !== 'dynamic').map((u) => u.file),
   ]);
   const previews = [];
   for (const f of files) {
@@ -564,7 +577,7 @@ function planRename(ix, from, to) {
     }
     previews.push({ file: f, write: next });
   }
-  return { previews, blocked, collision: !!(ix.defs[to] || ix.uses[to]) };
+  return { previews, blocked, collision: !!(ix.defs[to] || ix.isUsed(to)) };
 }
 
 // ---------- extract: lift a component's own rules out of the monolith ----------
@@ -572,9 +585,9 @@ function planRename(ix, from, to) {
 // shared stays put — silently moving a shared rule is how you break three other pages.
 function planExtract(ix, componentFile) {
   const abs = path.resolve(componentFile);
-  const mine = Object.keys(ix.uses).filter((n) => ix.uses[n].some((u) => path.resolve(u.file) === abs));
+  const mine = ix.usedNames().filter((n) => ix.usedBy(n).some((u) => path.resolve(u.file) === abs));
   const exclusive = new Set(mine.filter((n) =>
-    ix.uses[n].every((u) => path.resolve(u.file) === abs || CSS_EXT.has(path.extname(u.file)))));
+    ix.usedBy(n).every((u) => path.resolve(u.file) === abs || CSS_EXT.has(path.extname(u.file)))));
   const move = [], stay = [];
   const sheets = new Set();
   for (const n of mine) for (const d of ix.defs[n] || []) sheets.add(d.file);
@@ -594,7 +607,7 @@ function planExtract(ix, componentFile) {
         : span.classes.some((c) => overridden.has(c)) ? 'also overridden inside an at-rule — moving it would depend on import order'
         : span.classes.every((c) => exclusive.has(c)) ? null
         : 'shared with ' + [...new Set(span.classes.filter((c) => !exclusive.has(c))
-            .flatMap((c) => (ix.uses[c] || []).map((u) => u.file))
+            .flatMap((c) => ix.usedBy(c).map((u) => u.file))
             .filter((f) => path.resolve(f) !== abs && !CSS_EXT.has(path.extname(f))))]
             .map((f) => path.relative(ix.root, f)).join(', ');
       (why ? stay : move).push({ ...span, why });
@@ -635,10 +648,34 @@ function buildIndex(root) {
   const names = new Set(Object.keys(defs));
   const sorted = [...names].sort();
   const camelMap = new Map(sorted.map((n) => [camel(n), n]));
-  const prefixIdx = (p) => sorted.filter((n) => n.length > p.length && n.startsWith(p));
-  const suffixIdx = (p) => sorted.filter((n) => n.length > p.length && n.endsWith(p));
-  for (const f of srcFiles) parseSrc(f, names, prefixIdx, suffixIdx, uses, camelMap);
-  return { defs, uses, cssFiles, srcFiles, root, skipped };
+  const dyn = new Map();
+  for (const f of srcFiles) parseSrc(f, names, uses, camelMap, dyn);
+
+  const matchers = [...dyn.values()].map((d) => ({
+    ...d,
+    test: d.kind === 'prefix'
+      ? (n) => n.length > d.frag.length && n.startsWith(d.frag)
+      : (n) => n.length > d.frag.length && n.endsWith(d.frag),
+  }));
+  const SHOW = 200;                       // display cap only — never affects isUsed
+  const cache = new Map();
+  const usedBy = (name) => {
+    if (cache.has(name)) return cache.get(name);
+    const out = (uses[name] || []).slice();
+    for (const m of matchers) {
+      if (!m.test(name)) continue;
+      for (const site of m.sites.slice(0, SHOW)) out.push({ ...site, kind: 'dynamic' });
+    }
+    cache.set(name, out);
+    return out;
+  };
+  const isUsed = (name) => !!uses[name] || matchers.some((m) => m.test(name));
+  const usedNames = () => {
+    const out = new Set(Object.keys(uses));
+    for (const n of sorted) if (!out.has(n) && matchers.some((m) => m.test(n))) out.add(n);
+    return [...out];
+  };
+  return { defs, uses, usedBy, isUsed, usedNames, matchers, cssFiles, srcFiles, root, skipped };
 }
 
 // ---------- reporting ----------
@@ -655,7 +692,7 @@ function suggest(ix, name) {
 }
 
 function reportClass(ix, name) {
-  const defs = ix.defs[name] || [], uses = ix.uses[name] || [];
+  const defs = ix.defs[name] || [], uses = ix.usedBy(name);
   console.log(C.b('.' + name));
   if (!defs.length) {
     console.log(C.r('  not defined in any stylesheet'));
@@ -681,7 +718,7 @@ function reportImpact(ix, cssFile) {
   if (!own.length) return console.log('no classes defined in ' + cssFile);
   console.log(C.b('blast radius: ' + rel(ix.root, abs)) + '\n');
   const rows = own.map((n) => {
-    const u = ix.uses[n] || [];
+    const u = ix.usedBy(n);
     return { n, files: new Set(u.map((x) => x.file)).size, sites: u.length, dyn: u.some((x) => x.kind === 'dynamic') };
   }).sort((a, b) => b.sites - a.sites);
   const w = Math.max(...rows.map((r) => r.n.length)) + 2;
@@ -695,11 +732,11 @@ function reportImpact(ix, cssFile) {
 
 function reportFile(ix, srcFile) {
   const abs = path.resolve(srcFile);
-  const found = Object.keys(ix.uses).filter((n) => ix.uses[n].some((u) => path.resolve(u.file) === abs)).sort();
+  const found = ix.usedNames().filter((n) => ix.usedBy(n).some((u) => path.resolve(u.file) === abs)).sort();
   console.log(C.b('classes used by ' + rel(ix.root, abs)) + '\n');
   for (const n of found) {
     const d = (ix.defs[n] || [])[0];
-    const shared = new Set((ix.uses[n] || []).map((u) => u.file)).size;
+    const shared = new Set(ix.usedBy(n).map((u) => u.file)).size;
     console.log(C.g(('.' + n).padEnd(28)) + (d ? rel(ix.root, d.file) + ':' + d.line : C.r('undefined')) +
       (shared > 1 ? C.y('  shared with ' + (shared - 1) + ' other file(s)') : C.dim('  exclusive')));
   }
@@ -713,6 +750,12 @@ function main(argv) {
   const json = args.includes('--json');
   const target = args.filter((a) => !a.startsWith('--'))[0];
   const ix = buildIndex(root);
+  // a file the tool could not read is a hole in the answer — never hide it
+  if (ix.skipped.length) {
+    console.error(C.y('skipped ' + ix.skipped.length + ' file(s) — results below are incomplete:'));
+    for (const f of ix.skipped.slice(0, 5)) console.error(C.dim('  ' + rel(root, f)));
+    if (ix.skipped.length > 5) console.error(C.dim('  +' + (ix.skipped.length - 5) + ' more'));
+  }
 
   const standalone = args.includes('--tailwind') || args.includes('--vars') || args.includes('--diff') || args.includes('--install-hook');
   if (!standalone && !Object.keys(ix.defs).length) {
@@ -732,11 +775,15 @@ function main(argv) {
     process.exitCode = 1;
     if (!json) return;
   }
-  if (json) return console.log(JSON.stringify({ defs: ix.defs, uses: ix.uses }, null, 2));
+  if (json) {
+    const out = {};
+    for (const n of ix.usedNames()) out[n] = ix.usedBy(n);
+    return console.log(JSON.stringify({ defs: ix.defs, uses: out }, null, 2));
+  }
   if (args.includes('--orphans')) {
     const isExternal = (n) => ix.defs[n].every((d) => d.external);
-    const orphans = Object.keys(ix.defs).filter((n) => !ix.uses[n] && !isExternal(n)).sort();
-    const external = Object.keys(ix.defs).filter((n) => !ix.uses[n] && isExternal(n)).sort();
+    const orphans = Object.keys(ix.defs).filter((n) => !ix.isUsed(n) && !isExternal(n)).sort();
+    const external = Object.keys(ix.defs).filter((n) => !ix.isUsed(n) && isExternal(n)).sort();
     console.log(C.b(orphans.length + ' orphan class(es)') + C.dim(' — defined, never referenced\n'));
     for (const n of orphans) console.log(C.y('.' + n).padEnd(40) + C.dim(ix.defs[n].map((d) => rel(root, d.file) + ':' + d.line).join(', ')));
     if (external.length) console.log(C.dim('\n' + external.length + ' :global() class(es) skipped — generated by a library at runtime, not dead: ') +
@@ -745,9 +792,9 @@ function main(argv) {
     return;
   }
   if (args.includes('--dynamic')) {
-    const dyn = Object.keys(ix.uses).filter((n) => ix.uses[n].every((u) => u.kind === 'dynamic')).sort();
+    const dyn = Object.keys(ix.defs).filter((n) => !ix.uses[n] && ix.isUsed(n)).sort();
     console.log(C.b(dyn.length + ' class(es) matched only via string interpolation') + C.dim(' — verify by hand before deleting\n'));
-    for (const n of dyn) console.log(C.y('.' + n).padEnd(30) + C.dim(ix.uses[n].map((u) => rel(root, u.file) + ':' + u.line).join(', ')));
+    for (const n of dyn) console.log(C.y('.' + n).padEnd(30) + C.dim(ix.usedBy(n).slice(0, 4).map((u) => rel(root, u.file) + ':' + u.line).join(', ')));
     return;
   }
   if (args.includes('--tailwind')) {
@@ -784,7 +831,7 @@ function main(argv) {
       for (const span of cssRuleSpans(f)) {
         if (![...lines].some((l) => l >= span.start && l <= span.end)) continue;
         for (const cls of span.classes) {
-          if (!hit.has(cls)) hit.set(cls, { span, uses: ix.uses[cls] || [] });
+              if (!hit.has(cls)) hit.set(cls, { span, uses: ix.usedBy(cls) });
         }
       }
     }
@@ -908,7 +955,6 @@ function main(argv) {
   --root <dir>                scan somewhere else (default: cwd)
 
 indexed ${ix.cssFiles.length} stylesheet(s), ${ix.srcFiles.length} source file(s), ${Object.keys(ix.defs).length} classes`);
-    if (ix.skipped.length) console.log(C.dim(`skipped ${ix.skipped.length} unreadable file(s)`));
     return;
   }
   const ext = path.extname(target);
