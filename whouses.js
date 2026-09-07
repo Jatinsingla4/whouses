@@ -506,6 +506,31 @@ function literalClasses(root) {
 // the exact classes col-span-1 and col-span-2 rather than staying a guess
 const exprLiterals = (expr) => [...expr.matchAll(/['"]([^'"]*)['"]/g)].map((m) => m[1]).filter(Boolean);
 
+// `bg-${color}-50` is safe only if EVERY value color takes is covered, not just one.
+// Asking whether any bg-*-50 exists hid a real bug: four call sites passed colours that
+// were spelled out elsewhere and a fifth passed "orange", which was never generated.
+function propValues(root, name) {
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+  const out = new Set();
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pats = [
+    new RegExp('\\b' + esc + '\\s*=\\s*["\']([\\w-]+)["\']', 'g'),        // JSX attribute
+    new RegExp('\\b' + esc + '\\s*=\\s*\\{\\s*["\']([\\w-]+)["\']\\s*\\}', 'g'),  // color={"blue"}
+    new RegExp('\\b' + esc + '\\s*:\\s*["\']([\\w-]+)["\']', 'g'),        // object property
+  ];
+  for (const f of walk(root)) {
+    if (!SRC_EXT.has(path.extname(f))) continue;
+    const src = read(f);
+    if (src === null) continue;
+    for (const re of pats) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(src))) out.add(m[1]);
+    }
+  }
+  return out.size ? [...out] : null;
+}
+
 function scanTailwind(root) {
   const out = [];
   const literals = literalClasses(root);
@@ -513,7 +538,14 @@ function scanTailwind(root) {
 
   const judge = (file, line, prefix, expr, suffix, wrap, body) => {
     if (!TW.has(twHead(prefix))) return;
-    const values = exprLiterals(expr);
+    let values = exprLiterals(expr);
+    let via = 'literal';
+    if (!values.length) {
+      // a bare identifier: find every value it is actually given across the project
+      const bare = expr.replace(/^\$\{|\}$/g, '').trim();
+      const found = propValues(root, bare);
+      if (found) { values = found; via = 'prop'; }
+    }
     let resolved, missing;
     if (values.length) {
       resolved = values.map((v) => prefix + v + suffix);
@@ -526,7 +558,7 @@ function scanTailwind(root) {
       resolved = null;
       missing = hits.length ? [] : ['?'];
     }
-    const entry = { file, line, fragment: prefix, expr: wrap + body + wrap, resolved, suffix };
+    const entry = { file, line, fragment: prefix, expr: wrap + body + wrap, resolved, suffix, via };
     if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix)) return;
     if (missing.length) out.push({ ...entry, missing });
     else covered.push(entry);
@@ -995,8 +1027,9 @@ function main(argv) {
       console.log(C.r(rel(root, h.file) + ':' + h.line) + '  fragment ' + C.y(h.fragment + '${...}' + h.suffix));
       console.log(C.dim('    ' + h.expr.slice(0, 100)));
       if (h.resolved) {
-        console.log(C.dim('    resolves to ') + h.missing.join(', ') +
-          C.dim(', not spelled out anywhere else in the project'));
+        const how = h.via === 'prop' ? ' (from the values it is actually given)' : '';
+        console.log(C.dim('    resolves to ') + h.resolved.join(', ') + C.dim(how));
+        console.log(C.r('    never generated: ') + h.missing.join(', '));
       } else {
         console.log(C.dim('    cannot be resolved, and no class of this shape appears literally anywhere'));
       }
@@ -1152,5 +1185,5 @@ function main(argv) {
   reportClass(ix, target.replace(/^\./, ''));
 }
 
-module.exports = { buildIndex, usesTailwind, tailwindScope, literalClasses, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
+module.exports = { buildIndex, usesTailwind, tailwindScope, literalClasses, propValues, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
 if (require.main === module) main(process.argv);

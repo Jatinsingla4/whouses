@@ -322,5 +322,21 @@ ok('--tailwind says so plainly when the project has no Tailwind', () => {
   assert.ok(!/dynamic Tailwind class/.test(out), 'reported findings anyway: ' + out);
 });
 
+ok('a fragment is a bug if ANY value it takes is uncovered, not only if all are', () => {
+  // the real case: a StatCard given five colours, four spelled out elsewhere and one not.
+  // Asking "does any bg-*-50 exist" called this safe and hid a genuinely broken card.
+  w('vals/package.json', JSON.stringify({ name: 'v', dependencies: { tailwindcss: '^4' } }));
+  w('vals/Card.jsx', 'export const Card = ({ color }) => <div className={`bg-${color}-50 p-3`}/>;');
+  w('vals/Page.jsx', [
+    '<><Card color="blue"/><Card color="red"/><Card color="orange"/>',
+    '<i className="bg-blue-50"/><i className="bg-red-50"/></>',
+  ].join('\n'));
+  const hits = W.scanTailwind(path.join(root, 'vals'));
+  assert.strictEqual(hits.length, 1, JSON.stringify(hits));
+  assert.deepStrictEqual(hits[0].missing, ['bg-orange-50'],
+    'only orange is uncovered: ' + JSON.stringify(hits[0]));
+  assert.ok(hits[0].resolved.includes('bg-blue-50'), 'all values resolved, not just the broken one');
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — ' + n + ' edge cases, all previously shipped bugs');

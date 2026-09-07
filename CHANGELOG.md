@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.4.0
+
+`--tailwind` now resolves the values a variable actually takes, instead of asking
+whether any matching class happens to exist.
+
+2.3.0 stopped reporting a fragment when a class of that shape was spelled out
+somewhere. That removed the false positives, and it also hid a real bug. A
+component here takes a `color` prop and is rendered five times, with blue, purple,
+red, green and orange. Four of those colours appear literally elsewhere, so
+"does any bg-*-50 exist" answered yes and the fragment was cleared. But nothing in
+the project ever writes bg-orange-50, and checking the built CSS confirms it was
+never generated. That card ships unstyled.
+
+A fragment is safe only when EVERY value it can take is covered. The scanner now
+finds the values a bare identifier is given across the project, from JSX
+attributes, object properties and braced literals, resolves each into a full class
+name, and reports precisely which ones are never generated.
+
+On the same 6 Tailwind projects: 2 genuine bugs found, both confirmed missing from
+the real built CSS, and the previously reported col-span fragments still correctly
+cleared.
+
 ## 2.3.0
 
 `--tailwind` no longer reports a fragment as a bug when the classes it produces are
