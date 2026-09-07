@@ -483,20 +483,67 @@ const splitInterp = (s, re) => {
   return parts;
 };
 
+// Every token Tailwind itself would find. Tailwind scans files as plain text and
+// generates a utility if the complete class name appears ANYWHERE, so a fragment is
+// only a bug when nothing else in the project spells the resulting class out.
+function literalClasses(root) {
+  const set = new Set();
+  for (const f of walk(root)) {
+    if (!SRC_EXT.has(path.extname(f))) continue;
+    const src = read(f);
+    if (src === null) continue;
+    // permissive on purpose: Tailwind scans plain text, so a token anywhere in the
+    // file is enough for it to generate that utility, even in a comment
+    for (const t of src.split(/[^\w:/[\]().%-]+/)) {
+      if (!t || t.endsWith('-') || t.includes('$')) continue;   // fragments are not classes
+      if (t.length > 1) set.add(t);
+    }
+  }
+  return set;
+}
+
+// string literals inside an interpolation, so `col-span-${x ? '1' : '2'}` resolves to
+// the exact classes col-span-1 and col-span-2 rather than staying a guess
+const exprLiterals = (expr) => [...expr.matchAll(/['"]([^'"]*)['"]/g)].map((m) => m[1]).filter(Boolean);
+
 function scanTailwind(root) {
   const out = [];
-  const collect = (file, offs, at, body, wrap, parts) => {
-    for (const p of parts) {
-      if (!p.post) continue;                       // only a chunk running into an interpolation
-      const toks = p.text.split(/\s+/);
-      const frag = toks[toks.length - 1];
-      if (!frag || /\s$/.test(p.text)) continue;   // whitespace before it means a whole class
-      if (!TW.has(twHead(frag))) continue;
-      const line = lineAt(offs, at);
-      if (out.some((o) => o.file === file && o.line === line && o.fragment === frag)) continue;
-      out.push({ file, line, fragment: frag, expr: wrap + body + wrap });
+  const literals = literalClasses(root);
+  const covered = [];
+
+  const judge = (file, line, prefix, expr, suffix, wrap, body) => {
+    if (!TW.has(twHead(prefix))) return;
+    const values = exprLiterals(expr);
+    let resolved, missing;
+    if (values.length) {
+      resolved = values.map((v) => prefix + v + suffix);
+      missing = resolved.filter((c) => !literals.has(c));
+    } else {
+      // cannot evaluate it, so ask whether anything matching the shape is spelled out
+      const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '.+' + suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$');
+      const hits = [...literals].filter((c) => re.test(c));
+      resolved = null;
+      missing = hits.length ? [] : ['?'];
+    }
+    const entry = { file, line, fragment: prefix, expr: wrap + body + wrap, resolved, suffix };
+    if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix)) return;
+    if (missing.length) out.push({ ...entry, missing });
+    else covered.push(entry);
+  };
+
+  const scan = (file, offs, at, body, wrap, parts, interps) => {
+    for (let i = 0; i < interps.length; i++) {
+      const before = parts[i], after = parts[i + 1];
+      if (!before || /\s$/.test(before.text) || !before.text) continue;   // whitespace = whole class
+      const toks = before.text.split(/\s+/);
+      const prefix = toks[toks.length - 1];
+      if (!prefix) continue;
+      const suffix = after && !/^\s/.test(after.text) ? after.text.split(/\s+/)[0] : '';
+      judge(file, lineAt(offs, at), prefix, interps[i].text || '', suffix, wrap, body);
     }
   };
+
   for (const f of walk(root)) {
     if (!SRC_EXT.has(path.extname(f))) continue;
     if (!tailwindScope(f, root)) continue;       // a sibling project without Tailwind is not our business
@@ -504,20 +551,23 @@ function scanTailwind(root) {
     if (src === null) continue;
     const offs = lineOffsets(src);
     let m;
-    // template literals in a class position
     const tpl = /(?:class(?:Name)?\s*=\s*\{?|clsx\(|classnames\(|cn\(|cx\(|tw`)\s*`((?:[^`\\]|\\.)*)`/g;
     while ((m = tpl.exec(src))) {
       if (!m[1].includes('${')) continue;
-      collect(f, offs, m.index, m[1], '`', templateParts(m[1]).parts);
+      const { parts, interps } = templateParts(m[1]);
+      scan(f, offs, m.index, m[1], '`', parts, interps);
     }
-    // quoted class attributes carrying {{ ... }}
     const attr = /\bclass(?:Name)?\s*=\s*("([^"]*)"|'([^']*)')/g;
     while ((m = attr.exec(src))) {
       const body = m[2] !== undefined ? m[2] : m[3];
       if (!body || !body.includes('{{')) continue;
-      collect(f, offs, m.index, body, '"', splitInterp(body, /\{\{[\s\S]*?\}\}/g));
+      const parts = splitInterp(body, /\{\{[\s\S]*?\}\}/g);
+      const interps = [...body.matchAll(/\{\{[\s\S]*?\}\}/g)].map((x) => ({ text: x[0] }));
+      scan(f, offs, m.index, body, '"', parts, interps);
     }
   }
+  // non-enumerable so the result still deep-equals a plain array of findings
+  Object.defineProperty(out, 'covered', { value: covered, enumerable: false });
   return out;
 }
 
@@ -938,10 +988,27 @@ function main(argv) {
       return;
     }
     const hits = scanTailwind(root);
-    console.log(C.b(hits.length + ' dynamic Tailwind class(es)') + C.dim(' — the JIT scanner cannot see these, so the CSS is never generated\n'));
+    const safe = hits.covered || [];
+    console.log(C.b(hits.length + ' dynamic Tailwind class(es) that will not be generated') +
+      C.dim(hits.length ? '' : ' — nothing to fix') + '\n');
     for (const h of hits) {
-      console.log(C.r(rel(root, h.file) + ':' + h.line) + '  fragment ' + C.y(h.fragment + '${...}'));
+      console.log(C.r(rel(root, h.file) + ':' + h.line) + '  fragment ' + C.y(h.fragment + '${...}' + h.suffix));
       console.log(C.dim('    ' + h.expr.slice(0, 100)));
+      if (h.resolved) {
+        console.log(C.dim('    resolves to ') + h.missing.join(', ') +
+          C.dim(', not spelled out anywhere else in the project'));
+      } else {
+        console.log(C.dim('    cannot be resolved, and no class of this shape appears literally anywhere'));
+      }
+    }
+    if (safe.length) {
+      console.log(C.g((hits.length ? '\n' : '') + safe.length + ' other interpolated class(es) are fine') +
+        C.dim(' — the classes they produce are spelled out elsewhere, so Tailwind generates them:'));
+      for (const c of safe.slice(0, 5)) {
+        console.log(C.dim('  ' + rel(root, c.file) + ':' + c.line + '  ' + c.fragment + '${...}' + c.suffix +
+          (c.resolved ? '  -> ' + c.resolved.join(', ') : '')));
+      }
+      if (safe.length > 5) console.log(C.dim('  +' + (safe.length - 5) + ' more'));
     }
     if (hits.length) console.log(C.dim('\nfix: map to whole class names — { red: "bg-red-100", blue: "bg-blue-100" }[color]'));
     process.exitCode = hits.length ? 1 : 0;
@@ -1085,5 +1152,5 @@ function main(argv) {
   reportClass(ix, target.replace(/^\./, ''));
 }
 
-module.exports = { buildIndex, usesTailwind, tailwindScope, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
+module.exports = { buildIndex, usesTailwind, tailwindScope, literalClasses, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
 if (require.main === module) main(process.argv);

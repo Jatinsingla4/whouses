@@ -1,6 +1,6 @@
 {
   "name": "whouses",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Find who uses your CSS, including classes built at runtime that grep cannot see. Reads .css/.scss/.less and <style> blocks in HTML, Vue, Svelte and Astro. Flags Tailwind classes the JIT silently drops.",
   "keywords": [
     "css",

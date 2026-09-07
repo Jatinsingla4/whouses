@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.3.0
+
+`--tailwind` no longer reports a fragment as a bug when the classes it produces are
+generated anyway. This was the feature's biggest flaw and it made the command
+untrustworthy on real code.
+
+Tailwind scans source files as plain text and generates a utility if the complete
+class name appears anywhere in the project. So `bg-${color}-50` is only broken if
+no `bg-*-50` class is spelled out elsewhere. Previously every fragment was
+reported regardless, which meant:
+
+- Run across the 6 Tailwind projects on the author's machine, the command produced
+  5 findings and every single one was a false positive. Checked against the actual
+  built CSS: .col-span-1, .col-span-2, .bg-blue-50 and .text-blue-600 were all
+  present, because `col-span-1` alone appears literally 40 times in that codebase.
+
+Now:
+
+- Every token in the project is collected the way Tailwind's own scanner sees them,
+  and a fragment is reported only when nothing produces a matching class.
+- String literals inside the interpolation are resolved, so
+  `col-span-${wide ? '1' : '2'}` is known to mean col-span-1 and col-span-2 exactly,
+  rather than being treated as unknown.
+- Fragments that turn out to be safe are listed separately with the reason, instead
+  of being hidden, so the output explains itself.
+
+Validated against a real build, tailwindcss 4.3.3: every class the tool flags is
+genuinely absent from the output CSS, and every class it calls safe is genuinely
+present. Same 6 projects now report 0 findings and 5 correctly explained as safe.
+
 ## 2.2.0
 
 Checked `--tailwind` against every example on Tailwind's own "Detecting classes in

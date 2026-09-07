@@ -70,17 +70,29 @@ assert.ok(!ix.usedBy('card').some((u) => u.file.endsWith('prose.md')), 'markdown
 // orphans
 assert.ok(!ix.isUsed('nobody-uses-me'), 'orphan detected');
 
-// ---- Tailwind: flag fragments, never flag whole class names ----
+// ---- Tailwind: a fragment is a bug only if nothing spells the class out ----
 w('src/Tw.jsx', [
-  'const A = () => <div className={`bg-${color}-100 p-4`}/>;',           // BROKEN: fragment
-  "const B = () => <div className={`p-4 ${big ? 'text-lg' : 'text-sm'}`}/>;", // FINE: whole classes
-  'const C = () => <div className={`grid-cols-${n} gap-4`}/>;',          // BROKEN: fragment
-  'const D = () => <div className="bg-red-100 p-4"/>;',                  // FINE: no interpolation
-  'const E = () => <div className={`${cls} rounded`}/>;',                // FINE: nothing to judge
+  'const A = () => <div className={`bg-${color}-100 p-4`}/>;',        // covered by line 4 below
+  "const B = () => <div className={`p-4 ${big ? 'text-lg' : 'text-sm'}`}/>;", // whole classes, fine
+  'const C = () => <div className={`grid-cols-${n} gap-4`}/>;',       // BROKEN: nothing spells it out
+  'const D = () => <div className="bg-red-100 p-4"/>;',               // this is what covers line 1
+  'const E = () => <div className={`${cls} rounded`}/>;',             // nothing to judge
 ].join('\n'));
-const tw = scanTailwind(root).filter((h) => h.file.endsWith('Tw.jsx'));
-assert.deepStrictEqual(tw.map((h) => h.line), [1, 3], 'only the two real bugs, lines 1 and 3');
-assert.deepStrictEqual(tw.map((h) => h.fragment), ['bg-', 'grid-cols-'], 'multi-word prefixes survive');
+const tw = scanTailwind(root);
+const inTw = (arr) => arr.filter((h) => h.file.endsWith('Tw.jsx')).map((h) => h.line + ':' + h.fragment);
+assert.deepStrictEqual(inTw(tw), ['3:grid-cols-'], 'only the genuinely ungenerated one');
+assert.deepStrictEqual(inTw(tw.covered || []), ['1:bg-'],
+  'bg-${color}-100 is safe here because bg-red-100 is written literally on line 4');
+
+// remove the literal usage and the same line becomes a real bug
+w('src/Tw.jsx', 'const A = () => <div className={`bg-${color}-100 p-4`}/>;');
+const tw2 = scanTailwind(root);
+assert.deepStrictEqual(inTw(tw2), ['1:bg-'], 'with nothing spelling it out, it is reported');
+
+// a ternary of string literals resolves to exact class names
+w('src/Tw3.jsx', "const A = () => <div className={`col-span-${w ? '1' : '2'}`}/>;");
+const solo = scanTailwind(root).filter((h) => h.file.endsWith('Tw3.jsx'));
+assert.deepStrictEqual(solo[0].resolved, ['col-span-1', 'col-span-2'], JSON.stringify(solo[0]));
 
 // ---- CSS custom properties, traced across CSS *and* JS ----
 w('src/tok.css', ':root { --brand: #4f46e5; --dead: red }\n.x { color: var(--brand) }');
