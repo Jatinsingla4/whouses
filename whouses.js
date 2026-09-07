@@ -409,27 +409,113 @@ const TW = new Set(('bg text border ring outline fill stroke from via to decorat
   'resize snap duration delay ease animate transition blur brightness contrast grayscale ' +
   'saturate sepia backdrop table list underline line max min').split(' '));
 
+// a fragment's utility root: strip variant prefixes (hover:, md:, dark:) and any
+// arbitrary-value bracket, because Tailwind cannot see through the interpolation
+// regardless of what decorates it
+// Does this project use Tailwind at all? Without this, --tailwind reported
+// "Tailwind bugs" in projects with no Tailwind, where `p-${x}` is just someone's
+// own class naming scheme. Crying wolf is how a tool gets uninstalled.
+//
+// Resolved per project, not per run: a folder can hold several projects, only some
+// of which use Tailwind, and a finding in a non-Tailwind sibling is pure noise.
+const TW_CONFIGS = ['tailwind.config.js', 'tailwind.config.ts', 'tailwind.config.mjs', 'tailwind.config.cjs'];
+const twScopeCache = new Map();
+
+function dirUsesTailwind(dir) {
+  if (TW_CONFIGS.some((f) => fs.existsSync(path.join(dir, f)))) return true;
+  const pkgPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return null;                  // not a project boundary, keep walking
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    return Object.keys(deps).some((d) => /tailwind/i.test(d));
+  } catch {
+    return null;
+  }
+}
+
+// walk up from a file to its nearest project root and ask whether THAT project uses Tailwind
+function tailwindScope(file, root) {
+  let dir = path.dirname(path.resolve(file));
+  const stop = path.resolve(root);
+  const seen = [];
+  for (;;) {
+    if (twScopeCache.has(dir)) {
+      const v = twScopeCache.get(dir);
+      for (const d of seen) twScopeCache.set(d, v);
+      return v;
+    }
+    seen.push(dir);
+    const verdict = dirUsesTailwind(dir);
+    if (verdict !== null) {
+      for (const d of seen) twScopeCache.set(d, verdict);
+      return verdict;
+    }
+    const up = path.dirname(dir);
+    if (dir === stop || up === dir) break;
+    dir = up;
+  }
+  // no project boundary found at all: unknown, not proven absent. Only exclude a file
+  // when its own project demonstrably does not use Tailwind.
+  for (const d of seen) twScopeCache.set(d, true);
+  return true;
+}
+
+function usesTailwind(root, cssFiles) {
+  if (dirUsesTailwind(path.resolve(root)) === true) return true;
+  return (cssFiles || []).some((f) => /@tailwind\b|@import\s+["']tailwindcss/.test(read(f) || ''));
+}
+
+const twHead = (frag) => frag.split(':').pop().split('[')[0].replace(/-+$/, '');
+
+// split a class string on its interpolation syntax. Template literals use ${...}
+// and are brace-counted; Blade/Handlebars/Vue text interpolation uses {{...}}, which
+// is the very first example in Tailwind's own docs.
+const splitInterp = (s, re) => {
+  const parts = [];
+  let last = 0, m;
+  re.lastIndex = 0;
+  while ((m = re.exec(s))) {
+    parts.push({ text: s.slice(last, m.index), pre: last > 0, post: true });
+    last = m.index + m[0].length;
+  }
+  parts.push({ text: s.slice(last), pre: last > 0, post: false });
+  return parts;
+};
+
 function scanTailwind(root) {
   const out = [];
+  const collect = (file, offs, at, body, wrap, parts) => {
+    for (const p of parts) {
+      if (!p.post) continue;                       // only a chunk running into an interpolation
+      const toks = p.text.split(/\s+/);
+      const frag = toks[toks.length - 1];
+      if (!frag || /\s$/.test(p.text)) continue;   // whitespace before it means a whole class
+      if (!TW.has(twHead(frag))) continue;
+      const line = lineAt(offs, at);
+      if (out.some((o) => o.file === file && o.line === line && o.fragment === frag)) continue;
+      out.push({ file, line, fragment: frag, expr: wrap + body + wrap });
+    }
+  };
   for (const f of walk(root)) {
     if (!SRC_EXT.has(path.extname(f))) continue;
+    if (!tailwindScope(f, root)) continue;       // a sibling project without Tailwind is not our business
     const src = read(f);
     if (src === null) continue;
     const offs = lineOffsets(src);
-    const re = /(?:class(?:Name)?\s*=\s*\{?|clsx\(|classnames\(|cn\(|cx\(|tw`)\s*`((?:[^`\\]|\\.)*)`/g;
     let m;
-    while ((m = re.exec(src))) {
-      const body = m[1];
-      if (!body.includes('${')) continue;
-      for (const p of templateParts(body).parts) {
-        if (!p.post) continue;                       // only a chunk that runs into ${...}
-        const toks = p.text.split(/\s+/);
-        const frag = toks[toks.length - 1];
-        if (!frag || /\s$/.test(p.text)) continue;   // whitespace before ${} = a whole class, fine
-        const head = frag.replace(/-+$/, '');
-        if (!TW.has(head)) continue;
-        out.push({ file: f, line: lineAt(offs, m.index), fragment: frag, expr: '`' + body + '`' });
-      }
+    // template literals in a class position
+    const tpl = /(?:class(?:Name)?\s*=\s*\{?|clsx\(|classnames\(|cn\(|cx\(|tw`)\s*`((?:[^`\\]|\\.)*)`/g;
+    while ((m = tpl.exec(src))) {
+      if (!m[1].includes('${')) continue;
+      collect(f, offs, m.index, m[1], '`', templateParts(m[1]).parts);
+    }
+    // quoted class attributes carrying {{ ... }}
+    const attr = /\bclass(?:Name)?\s*=\s*("([^"]*)"|'([^']*)')/g;
+    while ((m = attr.exec(src))) {
+      const body = m[2] !== undefined ? m[2] : m[3];
+      if (!body || !body.includes('{{')) continue;
+      collect(f, offs, m.index, body, '"', splitInterp(body, /\{\{[\s\S]*?\}\}/g));
     }
   }
   return out;
@@ -807,9 +893,7 @@ function main(argv) {
 
   const standalone = args.includes('--tailwind') || args.includes('--vars') || args.includes('--diff') || args.includes('--install-hook');
   if (!standalone && !Object.keys(ix.defs).length) {
-    const tw = ix.cssFiles.some((f) => /@tailwind\b|@import\s+["']tailwindcss/.test(read(f) || '')) ||
-      ['tailwind.config.js', 'tailwind.config.ts', 'tailwind.config.mjs', 'tailwind.config.cjs']
-        .some((f) => fs.existsSync(path.join(root, f)));
+    const tw = usesTailwind(root, ix.cssFiles);
     console.error(C.y('no CSS classes found under ' + root));
     console.error(C.dim('  scanned ' + ix.cssFiles.length + ' stylesheet(s), ' + ix.srcFiles.length + ' source file(s).'));
     if (tw) {
@@ -846,6 +930,13 @@ function main(argv) {
     return;
   }
   if (args.includes('--tailwind')) {
+    if (!usesTailwind(root, ix.cssFiles)) {
+      console.log(C.y('this project does not appear to use Tailwind.'));
+      console.log(C.dim('  no tailwind config, no tailwind dependency, and no @tailwind or'));
+      console.log(C.dim('  @import "tailwindcss" in any stylesheet. Nothing to check.'));
+      console.log(C.dim('  for plain CSS use:  whouses --orphans   or   whouses .a-class'));
+      return;
+    }
     const hits = scanTailwind(root);
     console.log(C.b(hits.length + ' dynamic Tailwind class(es)') + C.dim(' — the JIT scanner cannot see these, so the CSS is never generated\n'));
     for (const h of hits) {
@@ -994,5 +1085,5 @@ function main(argv) {
   reportClass(ix, target.replace(/^\./, ''));
 }
 
-module.exports = { buildIndex, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
+module.exports = { buildIndex, usesTailwind, tailwindScope, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
 if (require.main === module) main(process.argv);

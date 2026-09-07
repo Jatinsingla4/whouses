@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.2.0
+
+Checked `--tailwind` against every example on Tailwind's own "Detecting classes in
+source files" page. Three gaps and one false positive, all fixed.
+
+- Variant-prefixed fragments were missed entirely. `hover:bg-${color}-100`,
+  `md:grid-cols-${n}` and `dark:text-${c}-500` were all silently ignored, and
+  variants are everywhere in real Tailwind code.
+- Arbitrary-value fragments were missed: `w-[calc(100%-${x}rem)]`.
+- `{{ }}` interpolation was missed. `class="text-{{ error ? 'red' : 'green' }}-600"`
+  is the first anti-pattern example on that docs page, and the scanner did not
+  look at quoted attributes at all.
+- `--tailwind` reported "Tailwind bugs" in projects with no Tailwind, where a
+  fragment like `p-${level}` is just someone's own class naming scheme. It now
+  detects whether Tailwind is actually used, and says so plainly when it is not.
+- Tailwind usage is resolved per project rather than per run, so in a folder
+  holding several projects a finding in a non-Tailwind sibling is no longer
+  reported.
+
+Confirmed unchanged: the two patterns Tailwind's docs recommend, mapping props to
+complete class names, are still never flagged. There are now tests pinning both
+the recommended and the anti-pattern examples straight from that page.
+
 ## 2.1.0
 
 - `--version` / `-v` print the version. They previously printed the help screen.

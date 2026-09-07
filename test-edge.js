@@ -264,5 +264,63 @@ ok('tracecss rejects an unknown command', () => {
   assert.notStrictEqual(r.status, 0);
 });
 
+// ---------- every pattern from Tailwind's own docs page ----------
+ok("the docs' recommended patterns are never flagged", () => {
+  w('tw1/Good.jsx', [
+    'export function A({ color }) {',
+    '  const colors = { black: "bg-black text-white", blue: "bg-blue-500 text-white" };',
+    '  return <button className={`${colors[color]} rounded-full px-2 py-1.5 text-sm/6 shadow`}/>;',
+    '}',
+    'export function B({ color }) {',
+    '  const v = { blue: "bg-blue-600 hover:bg-blue-500", red: "bg-red-600 hover:bg-red-500" };',
+    '  return <button className={`${v[color]} ...`}/>;',
+    '}',
+  ].join('\n'));
+  const hits = W.scanTailwind(path.join(root, 'tw1'));
+  assert.deepStrictEqual(hits, [], 'flagged the docs own correct example: ' + JSON.stringify(hits));
+});
+ok("the docs' anti-patterns are all flagged, variants included", () => {
+  w('tw2/Bad.jsx', [
+    'const a = <div className={`bg-${color}-600 hover:bg-${color}-500 ...`}/>;',
+    'const b = <div className={`hover:bg-${color}-100`}/>;',
+    'const c = <div className={`md:grid-cols-${n}`}/>;',
+    'const d = <div className={`dark:text-${c}-500`}/>;',
+    'const e = <div className={`w-[calc(100%-${x}rem)]`}/>;',
+  ].join('\n'));
+  const frags = W.scanTailwind(path.join(root, 'tw2')).map((h) => h.line + ':' + h.fragment).sort();
+  assert.deepStrictEqual(frags, [
+    '1:bg-', '1:hover:bg-', '2:hover:bg-', '3:md:grid-cols-', '4:dark:text-', '5:w-[calc(100%-',
+  ].sort(), JSON.stringify(frags));
+});
+ok('{{ }} interpolation in a class attribute is flagged', () => {
+  // the first anti-pattern example on Tailwind's docs page is Blade/Handlebars syntax
+  w('tw3/page.html', '<div class="text-{{ error ? \'red\' : \'green\' }}-600"></div>');
+  w('tw3/ok.html', '<div class="text-red-600"></div>');
+  const hits = W.scanTailwind(path.join(root, 'tw3'));
+  assert.strictEqual(hits.length, 1, JSON.stringify(hits));
+  assert.strictEqual(hits[0].fragment, 'text-');
+  assert.ok(hits[0].file.endsWith('page.html'));
+});
+
+ok('a sibling project without Tailwind is not reported on', () => {
+  // a folder holding several projects: only some use Tailwind, and a `p-${x}` in a
+  // non-Tailwind sibling is that developer's own class scheme, not a Tailwind bug
+  w('mono/with-tw/package.json', JSON.stringify({ name: 'a', dependencies: { tailwindcss: '^4' } }));
+  w('mono/with-tw/App.jsx', 'const a = <div className={`bg-${color}-100`}/>;');
+  w('mono/no-tw/package.json', JSON.stringify({ name: 'b', dependencies: { react: '^18' } }));
+  w('mono/no-tw/App.jsx', 'const b = <div className={`priority-tag p-${level}`}/>;');
+  const hits = W.scanTailwind(path.join(root, 'mono'));
+  assert.strictEqual(hits.length, 1, JSON.stringify(hits.map((h) => h.file + ':' + h.fragment)));
+  assert.ok(hits[0].file.includes('with-tw'), 'flagged the wrong project: ' + hits[0].file);
+});
+ok('--tailwind says so plainly when the project has no Tailwind', () => {
+  w('notw/package.json', JSON.stringify({ name: 'c', dependencies: { react: '^18' } }));
+  w('notw/a.css', '.btn { padding: 8px }');
+  w('notw/App.jsx', 'const a = <div className={`p-${x}`}/>;');
+  const out = run(['--root', path.join(root, 'notw'), '--tailwind']);
+  assert.match(out, /does not appear to use Tailwind/, out.slice(0, 200));
+  assert.ok(!/dynamic Tailwind class/.test(out), 'reported findings anyway: ' + out);
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log('ok — ' + n + ' edge cases, all previously shipped bugs');
