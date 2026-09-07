@@ -327,15 +327,239 @@ ok('a fragment is a bug if ANY value it takes is uncovered, not only if all are'
   // Asking "does any bg-*-50 exist" called this safe and hid a genuinely broken card.
   w('vals/package.json', JSON.stringify({ name: 'v', dependencies: { tailwindcss: '^4' } }));
   w('vals/Card.jsx', 'export const Card = ({ color }) => <div className={`bg-${color}-50 p-3`}/>;');
-  w('vals/Page.jsx', [
-    '<><Card color="blue"/><Card color="red"/><Card color="orange"/>',
-    '<i className="bg-blue-50"/><i className="bg-red-50"/></>',
-  ].join('\n'));
+  w('vals/Page.jsx', 'export default () => (<><Card color="blue"/><Card color="red"/><Card color="orange"/>' +
+    '<i className="bg-blue-50"/><i className="bg-red-50"/></>);');
   const hits = W.scanTailwind(path.join(root, 'vals'));
   assert.strictEqual(hits.length, 1, JSON.stringify(hits));
   assert.deepStrictEqual(hits[0].missing, ['bg-orange-50'],
     'only orange is uncovered: ' + JSON.stringify(hits[0]));
   assert.ok(hits[0].resolved.includes('bg-blue-50'), 'all values resolved, not just the broken one');
+});
+
+ok('prop values come from the owning component only, not any component with that prop name', () => {
+  w('scope/package.json', JSON.stringify({ name: 's', dependencies: { tailwindcss: '^4' } }));
+  w('scope/Card.jsx', 'export const Card = ({ color }) => <div className={`bg-${color}-50`}/>;');
+  w('scope/Chart.jsx', [
+    'export const A = () => <Legend color="#ff0000"/>;',
+    'export const B = () => <Svg color="currentColor"/>;',
+    'export const C = () => <Box color="primary"/>;',
+  ].join('\n'));
+  w('scope/Page.jsx', 'export default () => (<><Card color="blue"/><i className="bg-blue-50"/></>);');
+  const hits = W.scanTailwind(path.join(root, 'scope'));
+  assert.deepStrictEqual(hits, [],
+    'unrelated components polluted the values: ' + JSON.stringify(hits.map((h) => h.missing)));
+});
+ok('a call site with JSX inside an attribute is still read fully', () => {
+  // icon={<Database className="w-6 h-6" />} closes a naive [^>]* match early, so every
+  // prop after it was invisible and a genuinely broken colour was missed
+  w('jsx/package.json', JSON.stringify({ name: 'j', dependencies: { tailwindcss: '^4' } }));
+  w('jsx/Card.jsx', 'export const Card = ({ color }) => <div className={`bg-${color}-50`}/>;');
+  w('jsx/Page.jsx', [
+    'export default () => (<>',
+    '  <Card',
+    '    title="Database"',
+    '    icon={<Database className="w-6 h-6" />}',
+    '    color="orange"',
+    '  />',
+    '  <Card color="blue"/>',
+    '  <i className="bg-blue-50"/>',
+    '</>);',
+  ].join('\n'));
+  const hits = W.scanTailwind(path.join(root, 'jsx'));
+  assert.strictEqual(hits.length, 1, JSON.stringify(hits));
+  assert.ok(hits[0].resolved.includes('bg-orange-50'), 'the prop after the nested JSX was not read');
+  assert.deepStrictEqual(hits[0].missing, ['bg-orange-50']);
+});
+
+// ---------- the 10 defects an adversarial pass found in --tailwind ----------
+// Each was confirmed against a real tailwindcss build before being fixed.
+const twFix = (dir, files) => {
+  w(dir + '/package.json', JSON.stringify({ name: 'x', dependencies: { tailwindcss: '^4' } }));
+  for (const [f, c] of Object.entries(files)) w(dir + '/' + f, c);
+  return W.scanTailwind(path.join(root, dir));
+};
+
+ok('FP-1 a ternary condition operand is not a class value', () => {
+  const h = twFix('fp1', {
+    'Badge.jsx': 'export function Badge({ variant }) {\n  return <span className={`bg-${variant === "primary" ? "blue" : "gray"}-500`}/>;\n}',
+    'App.jsx': 'export default () => <div className="bg-blue-500 bg-gray-500"><Badge variant="primary"/></div>;',
+  });
+  assert.deepStrictEqual(h, [], 'invented bg-primary-500 from the comparison: ' + JSON.stringify(h));
+});
+ok('FP-2 a nested JSX attribute is not the outer component prop', () => {
+  const h = twFix('fp2', {
+    'Card.jsx': 'export function Card({ color, icon }) { return <div className={`bg-${color}-50`}>{icon}</div>; }',
+    'App.jsx': 'import { Card } from "./Card";\nexport default () => <div className="bg-red-50"><Card color="red" icon={<Icon color="currentColor"/>}/></div>;',
+  });
+  assert.deepStrictEqual(h, [], 'took the child icon prop as a colour: ' + JSON.stringify(h));
+});
+ok('FP-3 two components with the same name are not merged', () => {
+  const h = twFix('fp3', {
+    'web/Alert.jsx': 'export function Alert({ tone }) { return <div className={`bg-${tone}-100`}/>; }',
+    'web/Page.jsx': 'import { Alert } from "./Alert";\nexport default () => <div className="bg-red-100"><Alert tone="red"/></div>;',
+    'admin/Alert.jsx': 'const L = { critical: "border-red-600" };\nexport function Alert({ tone }) { return <div className={L[tone]}/>; }',
+    'admin/Console.jsx': 'import { Alert } from "./Alert";\nexport default () => <Alert tone="critical"/>;',
+  });
+  assert.deepStrictEqual(h, [], 'merged the admin Alert tone into the web one: ' + JSON.stringify(h));
+});
+ok('FP-4 a class spelled out in a non-JS file still counts', () => {
+  const h = twFix('fp4', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'export default () => <Card color="orange"/>;',
+    'legacy.py': 'BADGE = "bg-orange-50 text-orange-800"',
+  });
+  assert.deepStrictEqual(h, [], 'Tailwind scans .py too: ' + JSON.stringify(h));
+});
+ok('FP-5 @source inline() safelisting counts as generated', () => {
+  const h = twFix('fp5', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'export default () => <Card color="orange"/>;',
+    'in.css': '@import "tailwindcss";\n@source inline("bg-orange-50");',
+  });
+  assert.deepStrictEqual(h, [], 'safelisted class treated as missing: ' + JSON.stringify(h));
+});
+ok('FN-1 a multi-segment root is recognised', () => {
+  const h = twFix('fn1', {
+    'Text.jsx': 'export function Text({ shade }) {\n  return <p className={`text-gray-${shade} border-t-${shade} bg-red-${shade}`}/>;\n}\nexport const U = () => <Text shade="700"/>;',
+  });
+  assert.strictEqual(h.length, 3, 'text-gray-${n} class of fragments was dropped: ' + JSON.stringify(h));
+});
+ok('FN-2 spread props, default params and renamed imports are all handled', () => {
+  const spread = twFix('fn2a', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'import { Card } from "./Card";\nexport default () => <div className="bg-red-50"><Card {...{ color: "orange" }}/></div>;',
+  });
+  assert.strictEqual(spread.length, 1, 'a spread prop cannot be proven safe: ' + JSON.stringify(spread));
+  const dflt = twFix('fn2b', {
+    'Card.jsx': 'export function Card({ color = "orange" }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'import { Card } from "./Card";\nexport default () => <div className="bg-red-50"><Card color="red"/><Card/></div>;',
+  });
+  assert.strictEqual(dflt.length, 1, 'the default value orange was missed: ' + JSON.stringify(dflt));
+  const alias = twFix('fn2c', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'import { Card as Tile } from "./Card";\nexport default () => <div className="bg-red-50"><Tile color="orange"/></div>;',
+  });
+  assert.strictEqual(alias.length, 1, 'the renamed import was not followed: ' + JSON.stringify(alias));
+});
+ok('FN-3 a partly readable set of values is not treated as complete', () => {
+  const h = twFix('fn3', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-50`}/>; }',
+    'App.jsx': 'import { Card } from "./Card";\nconst T = ["orange"];\nexport default () => <div className="bg-red-50"><Card color="red"/>{T.map(t => <Card color={t}/>)}</div>;',
+  });
+  assert.strictEqual(h.length, 1, 'color={t} was unreadable, so this is not provably safe: ' + JSON.stringify(h));
+});
+ok('FN-4 the template need not sit directly after className=', () => {
+  for (const [name, code] of [
+    ['arg', 'export const C = ({ color }) => <div className={cn("rounded", `bg-${color}-50`)}/>;'],
+    ['ternary', 'export const C = ({ color, big }) => <div className={big ? `bg-${color}-50` : "p-1"}/>;'],
+  ]) {
+    const h = twFix('fn4' + name, { 'C.jsx': code + '\nexport default () => <C color="orange"/>;' });
+    assert.strictEqual(h.length, 1, name + ' was invisible: ' + JSON.stringify(h));
+  }
+});
+ok('FN-5 an interpolation at the start is judged by what it produces', () => {
+  const h = twFix('fn5', {
+    'Box.jsx': 'export const Box = ({ side }) => <div className={`${side}-4`}/>;\nexport default () => <Box side="mt"/>;',
+  });
+  assert.strictEqual(h.length, 1, 'mt-4 is never generated: ' + JSON.stringify(h));
+});
+ok('a template literal outside a class position is left alone', () => {
+  // `items[${i}]: must be an object` is an error message, and "items" is a real
+  // Tailwind root (items-center). Scanning every template made these false positives.
+  const h = twFix('ctx', {
+    'validate.js': 'export function check(i) {\n  throw new Error(`items[${i}]: must be an object`);\n}',
+  });
+  assert.deepStrictEqual(h, [], 'flagged an error message: ' + JSON.stringify(h));
+});
+
+// ---------- the 10 defects a SECOND adversarial pass found ----------
+ok('R2-1 a class-object argument does not hide the template after it', () => {
+  const h = twFix('r1', {
+    'Badge.jsx': 'export function Badge({ color, active }) {\n  return <span className={clsx("px-2", { "font-bold": active }, `bg-${color}-500`)}/>;\n}',
+    'App.jsx': 'export default () => <Badge color="orange"/>;',
+  });
+  assert.strictEqual(h.length, 1, 'the most common clsx form was invisible: ' + JSON.stringify(h));
+});
+ok('R2-3 a sibling attribute is not judged as a class', () => {
+  const h = twFix('r3', {
+    'Panel.jsx': 'export function Panel({ id, sort }) {\n  return <section className="p-4" id={`content-${id}`} data-sort={`order-${sort}`}/>;\n}',
+  });
+  assert.deepStrictEqual(h, [], 'an html id was reported as a class: ' + JSON.stringify(h));
+});
+ok('R2-2 utility families beyond the first segment are known', () => {
+  const h = twFix('r2', {
+    'L.jsx': 'export function L({ side, pe }) {\n  return <div><span className={`float-${side}`}/><span className={`pointer-events-${pe}`}/></div>;\n}',
+  });
+  assert.strictEqual(h.length, 2, 'float-* and pointer-events-* were dropped silently: ' + JSON.stringify(h));
+});
+ok('R2-4 member expressions, renamed destructuring, createElement and ?? are all handled', () => {
+  const member = twFix('r4a', {
+    'Card.jsx': 'export function Card({ color = "blue" }) { return <div className={`bg-${color}-500`}/>; }',
+    'App.jsx': 'import * as UI from "./Card";\nexport default () => <div className="bg-blue-500"><UI.Card color="orange"/></div>;',
+  });
+  assert.strictEqual(member.length, 1, '<UI.Card> call site missed: ' + JSON.stringify(member));
+  const renamed = twFix('r4b', {
+    'Card.jsx': 'export function Card({ color: c = "blue" }) { return <div className={`bg-${c}-500`}/>; }',
+    'App.jsx': 'import { Card } from "./Card";\nexport default () => <div className="bg-blue-500"><Card color="orange"/></div>;',
+  });
+  assert.strictEqual(renamed.length, 1, '{ color: c } rename not followed: ' + JSON.stringify(renamed));
+  const nullish = twFix('r4d', {
+    'Card.jsx': 'export function Card(props) { return <div className={`bg-${props.color ?? "blue"}-500`}/>; }',
+    'App.jsx': 'import { Card } from "./Card";\nexport default () => <div className="bg-blue-500"><Card color="orange"/></div>;',
+  });
+  assert.strictEqual(nullish.length, 1, 'a ?? fallback is not the complete value set: ' + JSON.stringify(nullish));
+});
+ok('R2-6 a class built one statement earlier is still found', () => {
+  const h = twFix('r6', {
+    'Alert.jsx': 'export function Alert({ tone }) {\n  const ring = `ring-${tone}-400`;\n  return <div className={ring}/>;\n}',
+    'styles.js': 'export const toneClass = (t) => `bg-${t}-500`;',
+    'App.jsx': 'import { toneClass } from "./styles";\nexport default () => <><Alert tone="orange"/><div className={toneClass("orange")}/></>;',
+  });
+  assert.strictEqual(h.length, 2, 'a template assigned to a variable, and a cross-file helper: ' + JSON.stringify(h));
+});
+ok('R2-7 a default belongs to its own component', () => {
+  const h = twFix('r7', {
+    'Badges.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-500`}/>; }\n\nexport function Spacer({ color = "chartreuse" }) { return <hr/>; }',
+    'App.jsx': 'export default () => <div className="bg-blue-500"><Card color="blue"/></div>;',
+  });
+  assert.deepStrictEqual(h, [], 'took the next component default: ' + JSON.stringify(h));
+});
+ok('R2-8 string method arguments are not class values', () => {
+  const h = twFix('r8', {
+    'Card.jsx': 'export function Card({ token }) { return <div className={`bg-${token.replace("_", "-")}-500`}/>; }',
+  });
+  assert.strictEqual(h.length, 1, JSON.stringify(h));
+  assert.strictEqual(h[0].resolved, null, 'invented bg-_-500 from a separator: ' + JSON.stringify(h[0]));
+});
+ok('R2-9 @source not inline() removes a class again', () => {
+  const h = twFix('r9', {
+    'Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-500`}/>; }',
+    'App.jsx': 'export default () => <Card color="orange"/>;',
+    'app.css': '@import "tailwindcss";\n@source inline("bg-{red,orange}-500");\n@source not inline("bg-orange-500");',
+  });
+  assert.strictEqual(h.length, 1, 'a de-safelisted class still counted as generated: ' + JSON.stringify(h));
+});
+ok('R2-5 text outside the content scope does not prove coverage', () => {
+  const scoped = twFix('r5a', {
+    'src/app.css': '@import "tailwindcss" source("./src");',
+    'src/Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-500`}/>; }',
+    'src/App.jsx': 'export default () => <Card color="orange"/>;',
+    'scripts/seed.py': 'PALETTE = "bg-orange-500"',
+  });
+  assert.strictEqual(scoped.length, 1, 'counted a file outside source(): ' + JSON.stringify(scoped));
+  const ignored = twFix('r5b', {
+    '.gitignore': 'storybook-static/',
+    'src/Card.jsx': 'export function Card({ color }) { return <div className={`bg-${color}-500`}/>; }',
+    'src/App.jsx': 'export default () => <Card color="orange"/>;',
+    'storybook-static/index.html': '<div class="bg-orange-500"></div>',
+  });
+  assert.strictEqual(ignored.length, 1, 'counted a gitignored build artifact: ' + JSON.stringify(ignored));
+});
+ok('R2-10 two fragments on one line are two findings', () => {
+  const h = twFix('r10', {
+    'Card.jsx': 'export function Card({ a, b }) { return <div className={`bg-${a}-500 bg-${b}-700`}/>; }',
+  });
+  assert.strictEqual(h.length, 2, 'the second fragment was deduped away: ' + JSON.stringify(h));
 });
 
 fs.rmSync(root, { recursive: true, force: true });

@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/whouses?color=cb3837&logo=npm)](https://www.npmjs.com/package/whouses)
 [![test](https://github.com/Jatinsingla4/whouses/actions/workflows/test.yml/badge.svg)](https://github.com/Jatinsingla4/whouses/actions/workflows/test.yml)
-[![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Jatinsingla4/whouses/blob/main/package.json)
+[![dependencies](https://img.shields.io/badge/dependencies-1-blue)](https://github.com/Jatinsingla4/whouses/blob/main/package.json)
 [![license](https://img.shields.io/npm/l/whouses?color=blue)](LICENSE)
 
 **You need to change a CSS class. Who breaks?**
@@ -415,7 +415,14 @@ silence, because a silent skip is a hole in the answer.
 
 ## Requirements
 
-Node 16+. Zero dependencies.
+Node 16+. One dependency, `@babel/parser`.
+
+It is there for a reason worth stating. Deciding which classes `` `bg-${color}-50` ``
+can produce means knowing what the expression evaluates to, and that is a question about
+JavaScript semantics: member expressions, renamed destructuring, default parameters,
+spread props, nullish fallbacks. That was attempted with regular expressions and got
+twenty defects wrong, each one confirmed against a real Tailwind build. Reading a real
+syntax tree makes those correct by construction rather than one pattern at a time.
 
 ## License
 

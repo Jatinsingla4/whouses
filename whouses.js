@@ -396,10 +396,6 @@ function parseSrc(file, names, uses, camelMap, dyn) {
   while ((d = dir.exec(src))) if (names.has(d[1])) hit(d[1], d.index, 'static');
 }
 
-// ---------- Tailwind: classes the JIT scanner will silently drop ----------
-// Tailwind generates CSS by grepping your files for COMPLETE class names.
-// `bg-${color}-100` never appears as text, so the CSS is never generated and
-// the element ships unstyled — with no error, at build or at runtime.
 const TW = new Set(('bg text border ring outline fill stroke from via to decoration divide ' +
   'placeholder accent caret shadow p px py pt pr pb pl m mx my mt mr mb ml w h size gap ' +
   'min-w max-w min-h max-h gap-x gap-y space-x space-y grid-cols grid-rows col-span row-span ' +
@@ -407,11 +403,30 @@ const TW = new Set(('bg text border ring outline fill stroke from via to decorat
   'opacity z top right bottom left inset translate-x translate-y scale rotate skew origin font ' +
   'leading tracking indent align whitespace break columns aspect object overflow cursor select ' +
   'resize snap duration delay ease animate transition blur brightness contrast grayscale ' +
-  'saturate sepia backdrop table list underline line max min').split(' '));
+  'saturate sepia backdrop table list underline line max min ' +
+  // families the first pass missed entirely, each verified against a real build
+  'float clear grid-flow auto-cols auto-rows col-end row-end pointer-events mix-blend ' +
+  'bg-blend will-change scroll-m scroll-mx scroll-my scroll-mt scroll-mr scroll-mb scroll-ml ' +
+  'scroll-p scroll-px scroll-py scroll-pt scroll-pr scroll-pb scroll-pl border-spacing ' +
+  'hue-rotate invert drop-shadow touch appearance caption isolation forced-color-adjust ' +
+  'stroke-width outline-offset ring-offset divide-x divide-y text-wrap field-sizing ' +
+  'inset-x inset-y start end backdrop-blur backdrop-brightness').split(' '));
 
-// a fragment's utility root: strip variant prefixes (hover:, md:, dark:) and any
-// arbitrary-value bracket, because Tailwind cannot see through the interpolation
-// regardless of what decorates it
+// A fragment's utility root. Strips variant prefixes (hover:, md:) and any
+// arbitrary-value bracket, then walks back segment by segment, because a root can be
+// multi-segment: `text-gray-${n}` has prefix "text-gray-", whose root is "text".
+function twHead(frag) {
+  let h = frag.split(':').pop().split('[')[0].replace(/-+$/, '');
+  while (h) {
+    if (TW.has(h)) return h;
+    const cut = h.lastIndexOf('-');
+    if (cut < 0) return null;
+    h = h.slice(0, cut);
+  }
+  return null;
+}
+
+
 // Does this project use Tailwind at all? Without this, --tailwind reported
 // "Tailwind bugs" in projects with no Tailwind, where `p-${x}` is just someone's
 // own class naming scheme. Crying wolf is how a tool gets uninstalled.
@@ -466,30 +481,54 @@ function usesTailwind(root, cssFiles) {
   return (cssFiles || []).some((f) => /@tailwind\b|@import\s+["']tailwindcss/.test(read(f) || ''));
 }
 
-const twHead = (frag) => frag.split(':').pop().split('[')[0].replace(/-+$/, '');
 
-// split a class string on its interpolation syntax. Template literals use ${...}
-// and are brace-counted; Blade/Handlebars/Vue text interpolation uses {{...}}, which
-// is the very first example in Tailwind's own docs.
-const splitInterp = (s, re) => {
-  const parts = [];
-  let last = 0, m;
-  re.lastIndex = 0;
-  while ((m = re.exec(s))) {
-    parts.push({ text: s.slice(last, m.index), pre: last > 0, post: true });
-    last = m.index + m[0].length;
+// Tailwind scans every file that is not gitignored, in node_modules, binary, CSS or a
+// lock file. Restricting this to SRC_EXT meant a class spelled out in a .py, .json or
+// .liquid file looked absent, and every fragment in a Django/Rails/CMS project was
+// reported broken.
+const NOT_SCANNED = /\.(css|scss|sass|less|styl|pcss|tcss|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf|eot|mp4|webm|mp3|zip|gz|pdf|map)$/i;
+const LOCKFILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'composer.lock', 'Gemfile.lock']);
+
+// Tailwind honours `@import "tailwindcss" source("./src")` and skips gitignored paths.
+// Counting text outside its real scope proved coverage that the build does not have.
+function contentScope(root) {
+  const dirs = [];
+  for (const f of walk(root)) {
+    if (!CSS_EXT.has(path.extname(f))) continue;
+    const src = read(f);
+    if (src === null) continue;
+    for (const m of src.matchAll(/@import\s+["']tailwindcss["']\s+source\(\s*["']([^"']+)["']\s*\)/g)) {
+      dirs.push(path.resolve(path.dirname(f), m[1]));
+    }
   }
-  parts.push({ text: s.slice(last), pre: last > 0, post: false });
-  return parts;
-};
+  return dirs;
+}
 
-// Every token Tailwind itself would find. Tailwind scans files as plain text and
-// generates a utility if the complete class name appears ANYWHERE, so a fragment is
-// only a bug when nothing else in the project spells the resulting class out.
+function gitIgnored(root) {
+  const out = [];
+  try {
+    for (let line of fs.readFileSync(path.join(root, '.gitignore'), 'utf8').split('\n')) {
+      line = line.trim();
+      if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+      out.push(path.resolve(root, line.replace(/^\//, '').replace(/\/$/, '')));
+    }
+  } catch { /* no .gitignore is fine */ }
+  return out;
+}
+
 function literalClasses(root) {
   const set = new Set();
+  const scope = contentScope(root);
+  const ignored = gitIgnored(root);
+  const inScope = (f) => {
+    const r = path.resolve(f);
+    if (ignored.some((i) => r === i || r.startsWith(i + path.sep))) return false;
+    if (!scope.length) return true;
+    return scope.some((d) => r.startsWith(d + path.sep) || r === d);
+  };
   for (const f of walk(root)) {
-    if (!SRC_EXT.has(path.extname(f))) continue;
+    if (NOT_SCANNED.test(f) || LOCKFILES.has(path.basename(f))) continue;
+    if (!inScope(f)) continue;
     const src = read(f);
     if (src === null) continue;
     // permissive on purpose: Tailwind scans plain text, so a token anywhere in the
@@ -499,108 +538,458 @@ function literalClasses(root) {
       if (t.length > 1) set.add(t);
     }
   }
+  for (const c of safelisted(root)) set.add(c);
   return set;
 }
 
-// string literals inside an interpolation, so `col-span-${x ? '1' : '2'}` resolves to
-// the exact classes col-span-1 and col-span-2 rather than staying a guess
-const exprLiterals = (expr) => [...expr.matchAll(/['"]([^'"]*)['"]/g)].map((m) => m[1]).filter(Boolean);
-
-// `bg-${color}-50` is safe only if EVERY value color takes is covered, not just one.
-// Asking whether any bg-*-50 exists hid a real bug: four call sites passed colours that
-// were spelled out elsewhere and a fifth passed "orange", which was never generated.
-function propValues(root, name) {
-  if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
-  const out = new Set();
-  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pats = [
-    new RegExp('\\b' + esc + '\\s*=\\s*["\']([\\w-]+)["\']', 'g'),        // JSX attribute
-    new RegExp('\\b' + esc + '\\s*=\\s*\\{\\s*["\']([\\w-]+)["\']\\s*\\}', 'g'),  // color={"blue"}
-    new RegExp('\\b' + esc + '\\s*:\\s*["\']([\\w-]+)["\']', 'g'),        // object property
-  ];
-  for (const f of walk(root)) {
-    if (!SRC_EXT.has(path.extname(f))) continue;
-    const src = read(f);
-    if (src === null) continue;
-    for (const re of pats) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(src))) out.add(m[1]);
+// brace expansion, as Tailwind documents for @source inline: {a,b}, {1..9}, {1..9..2}
+function expandBraces(pattern) {
+  const open = pattern.indexOf('{');
+  if (open < 0) return [pattern];
+  let depth = 0, close = -1;
+  for (let i = open; i < pattern.length; i++) {
+    if (pattern[i] === '{') depth++;
+    else if (pattern[i] === '}' && --depth === 0) { close = i; break; }
+  }
+  if (close < 0) return [pattern];
+  const head = pattern.slice(0, open), tail = pattern.slice(close + 1);
+  const body = pattern.slice(open + 1, close);
+  const opts = [];
+  let d = 0, cur = '';
+  for (const ch of body) {
+    if (ch === '{') d++;
+    if (ch === '}') d--;
+    if (ch === ',' && d === 0) { opts.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  opts.push(cur);
+  const out = [];
+  for (const opt of opts) {
+    const range = /^(-?\d+)\.\.(-?\d+)(?:\.\.(\d+))?$/.exec(opt.trim());
+    if (range) {
+      const [a, b] = [+range[1], +range[2]];
+      const step = Math.abs(+(range[3] || 1)) || 1;
+      for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) out.push(String(v));
+    } else {
+      out.push(...expandBraces(opt));
     }
   }
-  return out.size ? [...out] : null;
+  return out.flatMap((v) => expandBraces(head + v + tail));
+}
+
+// classes Tailwind is told to generate regardless of whether they appear in source
+function safelisted(root) {
+  const out = [], excluded = [];
+  for (const f of walk(root)) {
+    if (!CSS_EXT.has(path.extname(f))) continue;
+    const src = read(f);
+    if (src === null) continue;
+    for (const m of src.matchAll(/@source\s+(not\s+)?inline\(\s*["']([^"']+)["']\s*\)/g)) {
+      const classes = expandBraces(m[2]);
+      if (m[1]) excluded.push(...classes);          // @source not inline() un-generates them
+      else out.push(...classes);
+    }
+  }
+  return out.filter((c) => !excluded.includes(c));
+}
+
+
+// ---------- Tailwind: classes the JIT scanner will silently drop ----------
+// Tailwind generates a utility only if the COMPLETE class name appears somewhere in
+// the project as plain text. `bg-${color}-50` produces a name that is never written
+// down, so the element ships unstyled with no error.
+//
+// Deciding which classes a fragment can produce means knowing what the expression
+// evaluates to. That was attempted with regular expressions and failed twenty times
+// in ways confirmed against real Tailwind builds: member expressions, renamed
+// destructuring, default parameters, spread props, nullish fallbacks, string methods.
+// Those are language semantics, so this reads a real syntax tree instead.
+const { parse } = require('@babel/parser');
+
+const PARSE_OPTS = {
+  sourceType: 'unambiguous',
+  errorRecovery: true,
+  plugins: ['jsx', 'typescript', 'decorators-legacy', 'classProperties', 'dynamicImport'],
+};
+
+function parseFile(src) {
+  try { return parse(src, PARSE_OPTS); } catch { return null; }
+}
+
+function walkAst(node, visit, parent) {
+  if (!node || typeof node.type !== 'string') return;
+  visit(node, parent);
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'leadingComments' || key === 'trailingComments') continue;
+    const v = node[key];
+    if (Array.isArray(v)) { for (const c of v) walkAst(c, visit, node); }
+    else if (v && typeof v.type === 'string') walkAst(v, visit, node);
+  }
+}
+
+const CLASS_ATTRS = new Set(['className', 'class']);
+const CLASS_FNS = new Set(['clsx', 'classnames', 'classNames', 'cn', 'cx', 'twMerge', 'cva', 'tv', 'tw']);
+
+// the component a node sits inside, and the props it declares
+function componentIndex(ast) {
+  const comps = [];
+  walkAst(ast, (n) => {
+    let name = null, params = null;
+    if (n.type === 'FunctionDeclaration' && n.id) { name = n.id.name; params = n.params; }
+    else if (n.type === 'VariableDeclarator' && n.id.type === 'Identifier' &&
+             n.init && /FunctionExpression|ArrowFunctionExpression/.test(n.init.type)) {
+      name = n.id.name; params = n.init.params;
+    }
+    if (name && /^[A-Z]/.test(name)) comps.push({ name, params: params || [], start: n.start, end: n.end });
+  });
+  return comps;
+}
+
+// which local identifier maps to which declared prop, following renames and defaults
+function propBindings(params) {
+  const map = new Map();        // local name -> { prop, default }
+  const first = params[0];
+  if (!first) return map;
+  if (first.type === 'Identifier') return map;      // (props) => ..., handled as member access
+  if (first.type !== 'ObjectPattern') return map;
+  for (const p of first.properties) {
+    if (p.type !== 'ObjectProperty') continue;
+    const prop = p.key.name || p.key.value;
+    let target = p.value, dflt = null;
+    if (target.type === 'AssignmentPattern') {
+      dflt = target.right.type === 'StringLiteral' ? target.right.value : null;
+      target = target.left;
+    }
+    if (target.type === 'Identifier') map.set(target.name, { prop, default: dflt });
+  }
+  return map;
+}
+
+const jsxName = (n) => n.type === 'JSXIdentifier' ? n.name
+  : n.type === 'JSXMemberExpression' ? jsxName(n.property) : null;
+
+// every value a prop is given, across every call site of a component
+// which local names in this file refer to the component declared in defFile
+function importedAs(ast, file, defFile, component) {
+  const names = new Set();
+  if (path.resolve(file) === path.resolve(defFile)) names.add(component);
+  if (!ast) return names;
+  walkAst(ast, (n) => {
+    if (n.type !== 'ImportDeclaration' || !n.source.value.startsWith('.')) return;
+    const base = path.resolve(path.dirname(file), n.source.value);
+    const target = path.resolve(defFile);
+    const hit = ['', '.jsx', '.tsx', '.js', '.ts', '.mjs', '.vue', '.svelte']
+      .some((e) => base + e === target || path.join(base, 'index' + e) === target);
+    if (!hit) return;
+    for (const sp of n.specifiers) {
+      if (sp.type === 'ImportSpecifier' && (sp.imported.name || sp.imported.value) === component) names.add(sp.local.name);
+      else if (sp.type === 'ImportDefaultSpecifier' || sp.type === 'ImportNamespaceSpecifier') names.add(sp.local.name);
+    }
+  });
+  return names;
+}
+
+const csCache = new Map();
+function callSiteValues(files, component, prop, defFile) {
+  const key = component + '\u0000' + prop + '\u0000' + (defFile || '');
+  if (csCache.has(key)) return csCache.get(key);
+  const result = callSiteValuesUncached(files, component, prop, defFile);
+  csCache.set(key, result);
+  return result;
+}
+
+function callSiteValuesUncached(files, component, prop, defFile) {
+  const collect = (byImport) => {
+    const values = new Set();
+    let complete = true, sites = 0;
+    for (const entry of files) {
+      const { ast, file } = entry;
+      if (!ast) continue;
+      const names = byImport && defFile ? importedAs(ast, file, defFile, component) : new Set([component]);
+      if (!names.size) continue;
+      walkAst(ast, (n) => {
+        if (n.type === 'JSXOpeningElement' && names.has(jsxName(n.name))) {
+          sites++;
+          for (const a of n.attributes) {
+            if (a.type === 'JSXSpreadAttribute') { complete = false; continue; }
+            if (!a.name || a.name.name !== prop) continue;
+            const v = a.value;
+            if (!v) continue;
+            if (v.type === 'StringLiteral') { values.add(v.value); continue; }
+            if (v.type === 'JSXExpressionContainer') {
+              const r = staticValues(v.expression);
+              if (r.complete && r.values.length) for (const x of r.values) values.add(x);
+              else complete = false;
+            } else complete = false;
+          }
+          return;
+        }
+        // React.createElement(Card, { color: 'orange' })
+        if (n.type !== 'CallExpression') return;
+        const callee = n.callee;
+        const isCE = (callee.type === 'Identifier' && callee.name === 'createElement') ||
+          (callee.type === 'MemberExpression' && callee.property && callee.property.name === 'createElement');
+        if (!isCE || !n.arguments.length) return;
+        if (n.arguments[0].type !== 'Identifier' || !names.has(n.arguments[0].name)) return;
+        sites++;
+        const props = n.arguments[1];
+        if (!props || props.type !== 'ObjectExpression') { complete = false; return; }
+        for (const pr of props.properties) {
+          if (pr.type === 'SpreadElement') { complete = false; continue; }
+          if (!pr.key || (pr.key.name || pr.key.value) !== prop) continue;
+          const r = staticValues(pr.value);
+          if (r.complete && r.values.length) for (const x of r.values) values.add(x);
+          else complete = false;
+        }
+      });
+    }
+    return { values: [...values], complete, sites };
+  };
+
+  const precise = collect(true);
+  if (precise.sites) return precise;
+  // no resolvable import reached it: barrel export, auto-import, or an untyped fixture.
+  // Fall back to the bare name rather than treating the component as never rendered.
+  return collect(false);
+}
+
+// what can this expression evaluate to, as a set of strings
+function staticValues(node) {
+  if (!node) return { values: [], complete: false };
+  switch (node.type) {
+    case 'StringLiteral':
+      return { values: [node.value], complete: true };
+    case 'NumericLiteral':
+      return { values: [String(node.value)], complete: true };
+    case 'TemplateLiteral':
+      if (!node.expressions.length) return { values: [node.quasis[0].value.cooked], complete: true };
+      return { values: [], complete: false };
+    case 'ConditionalExpression': {
+      const a = staticValues(node.consequent), b = staticValues(node.alternate);
+      return { values: [...a.values, ...b.values], complete: a.complete && b.complete };
+    }
+    case 'LogicalExpression': {
+      // `props.color ?? 'blue'` shows only the fallback, the left side is unknown
+      const a = staticValues(node.left), b = staticValues(node.right);
+      return { values: [...a.values, ...b.values], complete: a.complete && b.complete };
+    }
+    case 'TSAsExpression':
+    case 'TSSatisfiesExpression':
+    case 'ParenthesizedExpression':
+      return staticValues(node.expression);
+    default:
+      return { values: [], complete: false };
+  }
+}
+
+// the class-carrying expressions in a file: a className attribute's value, and any
+// clsx/cn/cva call. A template literal anywhere inside one of these is a class string;
+// one outside is an error message or an id, and must not be judged.
+function classExpressions(ast) {
+  const out = [];
+  walkAst(ast, (n) => {
+    if (n.type === 'JSXAttribute' && n.name && CLASS_ATTRS.has(jsxName(n.name) || n.name.name) && n.value) {
+      out.push(n.value.type === 'JSXExpressionContainer' ? n.value.expression : n.value);
+    }
+    if (n.type === 'CallExpression') {
+      const c = n.callee;
+      const name = c.type === 'Identifier' ? c.name : c.type === 'MemberExpression' ? c.property.name : null;
+      if (name && CLASS_FNS.has(name)) out.push(...n.arguments);
+    }
+  });
+  return out;
+}
+
+// resolve an identifier used as a class value back to what it was assigned
+// name -> initialiser, built once for the whole project. Doing this per identifier
+// re-walked every AST and made a real project take minutes.
+function bindingIndex(files) {
+  const local = new Map();     // file -> Map(name -> init)
+  for (const { file, ast } of files) {
+    if (!ast) continue;
+    const m = new Map();
+    walkAst(ast, (n) => {
+      if (n.type !== 'VariableDeclarator' || n.id.type !== 'Identifier' || !n.init) return;
+      if (!m.has(n.id.name)) m.set(n.id.name, n.init);
+    });
+    local.set(file, m);
+  }
+  return local;
+}
+
+// bindings visible in one file: its own, plus what it explicitly imports. A project-wide
+// name map looked tempting and was catastrophic: every identifier resolved to some
+// unrelated template somewhere and Billing System went from 2 findings to 68.
+function visibleBindings(file, ast, local) {
+  const out = new Map(local.get(file) || []);
+  if (!ast) return out;
+  walkAst(ast, (n) => {
+    if (n.type !== 'ImportDeclaration' || !n.source.value.startsWith('.')) return;
+    const base = path.resolve(path.dirname(file), n.source.value);
+    let from = null;
+    for (const e of ['', '.js', '.jsx', '.ts', '.tsx', '.mjs']) {
+      for (const cand of [base + e, path.join(base, 'index' + e)]) {
+        if (local.has(cand)) { from = local.get(cand); break; }
+      }
+      if (from) break;
+    }
+    if (!from) return;
+    for (const sp of n.specifiers) {
+      const orig = sp.type === 'ImportSpecifier' ? (sp.imported.name || sp.imported.value) : sp.local.name;
+      if (from.has(orig)) out.set(sp.local.name, from.get(orig));
+    }
+  });
+  return out;
+}
+
+function templatesIn(node, binds, seen = new Set()) {
+  const out = [];
+  walkAst(node, (n) => {
+    if (n.type === 'TemplateLiteral' && n.expressions.length) out.push(n);
+    // className={ring} where ring holds the template, or a helper that returns one
+    if (n.type === 'Identifier' && !seen.has(n.name)) {
+      seen.add(n.name);
+      const init = binds.get(n.name);
+      if (init) out.push(...templatesIn(init, binds, seen));
+    }
+  });
+  return out;
+}
+
+// A single-file component is not JavaScript. Parse only its <script>, keeping every
+// offset, so line numbers still point at the real file.
+function scriptOf(file, src) {
+  if (!HTML_EXT.has(path.extname(file))) return src;
+  let out = src.replace(/[^\n]/g, ' ');
+  for (const m of src.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+    const at = m.index + m[0].indexOf(m[1]);
+    out = out.slice(0, at) + m[1] + out.slice(at + m[1].length);
+  }
+  return out;
 }
 
 function scanTailwind(root) {
-  const out = [];
+  csCache.clear();
+  const out = [], covered = [];
   const literals = literalClasses(root);
-  const covered = [];
+  let binds = null;
 
-  const judge = (file, line, prefix, expr, suffix, wrap, body) => {
-    if (!TW.has(twHead(prefix))) return;
-    let values = exprLiterals(expr);
-    let via = 'literal';
-    if (!values.length) {
-      // a bare identifier: find every value it is actually given across the project
-      const bare = expr.replace(/^\$\{|\}$/g, '').trim();
-      const found = propValues(root, bare);
-      if (found) { values = found; via = 'prop'; }
-    }
-    let resolved, missing;
-    if (values.length) {
-      resolved = values.map((v) => prefix + v + suffix);
-      missing = resolved.filter((c) => !literals.has(c));
-    } else {
-      // cannot evaluate it, so ask whether anything matching the shape is spelled out
-      const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
-        '.+' + suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$');
-      const hits = [...literals].filter((c) => re.test(c));
-      resolved = null;
-      missing = hits.length ? [] : ['?'];
-    }
-    const entry = { file, line, fragment: prefix, expr: wrap + body + wrap, resolved, suffix, via };
-    if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix)) return;
-    if (missing.length) out.push({ ...entry, missing });
-    else covered.push(entry);
-  };
-
-  const scan = (file, offs, at, body, wrap, parts, interps) => {
-    for (let i = 0; i < interps.length; i++) {
-      const before = parts[i], after = parts[i + 1];
-      if (!before || /\s$/.test(before.text) || !before.text) continue;   // whitespace = whole class
-      const toks = before.text.split(/\s+/);
-      const prefix = toks[toks.length - 1];
-      if (!prefix) continue;
-      const suffix = after && !/^\s/.test(after.text) ? after.text.split(/\s+/)[0] : '';
-      judge(file, lineAt(offs, at), prefix, interps[i].text || '', suffix, wrap, body);
-    }
-  };
-
+  const files = [];
   for (const f of walk(root)) {
     if (!SRC_EXT.has(path.extname(f))) continue;
-    if (!tailwindScope(f, root)) continue;       // a sibling project without Tailwind is not our business
+    if (!tailwindScope(f, root)) continue;
     const src = read(f);
     if (src === null) continue;
-    const offs = lineOffsets(src);
-    let m;
-    const tpl = /(?:class(?:Name)?\s*=\s*\{?|clsx\(|classnames\(|cn\(|cx\(|tw`)\s*`((?:[^`\\]|\\.)*)`/g;
-    while ((m = tpl.exec(src))) {
-      if (!m[1].includes('${')) continue;
-      const { parts, interps } = templateParts(m[1]);
-      scan(f, offs, m.index, m[1], '`', parts, interps);
+    files.push({ file: f, src, ast: parseFile(scriptOf(f, src)), offs: lineOffsets(src) });
+  }
+
+  const judge = (file, offs, tpl, node, ctx) => {
+    for (let i = 0; i < tpl.expressions.length; i++) {
+      const before = tpl.quasis[i].value.cooked ?? '';
+      const after = tpl.quasis[i + 1] ? (tpl.quasis[i + 1].value.cooked ?? '') : '';
+      const prefix = (!before || /\s$/.test(before)) ? '' : before.split(/\s+/).pop();
+      const suffix = (!after || /^\s/.test(after)) ? '' : after.split(/\s+/)[0];
+      if (!prefix && !suffix) continue;                 // `${cls} rounded` is a whole class
+      if (prefix && !twHead(prefix)) continue;          // not a Tailwind utility at all
+
+      const expr = tpl.expressions[i];
+      let { values, complete } = staticValues(expr);
+      let via = 'literal';
+      if (!values.length || !complete) {
+        const resolved = resolveIdentifier(expr, ctx);
+        if (resolved) { values = resolved.values; complete = resolved.complete; via = 'prop'; }
+      }
+      const line = lineAt(offs, expr.start);
+      const entry = { file, line, fragment: prefix, suffix, via,
+        expr: '`' + rawTemplate(tpl, ctx.src) + '`' };
+      if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix && o.suffix === suffix)) continue;
+      if (covered.some((o) => o.file === file && o.line === line && o.fragment === prefix && o.suffix === suffix)) continue;
+
+      if (values.length && complete) {
+        const produced = values.map((v) => prefix + v + suffix).filter((c) => twHead(c));
+        if (!produced.length) continue;
+        const missing = produced.filter((c) => !literals.has(c));
+        if (missing.length) out.push({ ...entry, resolved: produced, missing });
+        else covered.push({ ...entry, resolved: produced });
+      } else if (prefix) {
+        // cannot be evaluated, so it cannot be proven safe
+        out.push({ ...entry, resolved: null, missing: ['?'] });
+      }
+      // with no prefix and nothing resolvable there is no evidence this is a class at
+      // all: `${v.toFixed(1)}s` is "1.5s" and `${Math.round(v)}ms` is a duration
     }
-    const attr = /\bclass(?:Name)?\s*=\s*("([^"]*)"|'([^']*)')/g;
-    while ((m = attr.exec(src))) {
-      const body = m[2] !== undefined ? m[2] : m[3];
-      if (!body || !body.includes('{{')) continue;
-      const parts = splitInterp(body, /\{\{[\s\S]*?\}\}/g);
-      const interps = [...body.matchAll(/\{\{[\s\S]*?\}\}/g)].map((x) => ({ text: x[0] }));
-      scan(f, offs, m.index, body, '"', parts, interps);
+  };
+
+  // an identifier in a template is usually a prop: find what callers pass for it
+  const resolveIdentifier = (expr, ctx) => {
+    let local = null;
+    if (expr.type === 'Identifier') local = expr.name;
+    else if (expr.type === 'MemberExpression' && expr.object.type === 'Identifier' &&
+             expr.property.type === 'Identifier' && !expr.computed) local = expr.property.name;
+    if (!local || !ctx.component) return null;
+    const bound = ctx.bindings.get(local);
+    const prop = bound ? bound.prop : local;
+    const r = callSiteValues(files, ctx.component.name, prop, ctx.file);
+    if (bound && bound.default) r.values.push(bound.default);
+    if (!r.sites && !r.values.length) return null;
+    return { values: [...new Set(r.values)], complete: r.complete };
+  };
+
+  for (const entry of files) {
+    const { file, src, ast, offs } = entry;
+    // markup attributes in single-file components and plain templates
+    if (HTML_EXT.has(path.extname(file)) || /\.(html?|hbs|ejs|erb|php|twig)$/i.test(file)) {
+      for (const m of src.matchAll(/\b(?::|v-bind:|\[)?class(?:Name)?\]?\s*=\s*"([^"]*)"/g)) {
+        const body = m[1];
+        const at = m.index + m[0].indexOf(body);
+        if (body.includes('{{')) markupFragments(body, /\{\{[\s\S]*?\}\}/g, file, offs, at, out);
+        else if (body.includes('${')) markupFragments(body.replace(/^`|`$/g, ''), /\$\{[^}]*\}/g, file, offs, at, out);
+      }
+    }
+    if (!ast) continue;
+    if (!binds) binds = bindingIndex(files);
+    const fileBinds = visibleBindings(file, ast, binds);
+    const comps = componentIndex(ast);
+    for (const clsExpr of classExpressions(ast)) {
+      for (const tpl of templatesIn(clsExpr, fileBinds)) {
+        const comp = comps.filter((c) => tpl.start >= c.start && tpl.end <= c.end).pop() || null;
+        judge(file, offs, tpl, tpl, { src, file, component: comp, bindings: comp ? propBindings(comp.params) : new Map() });
+      }
     }
   }
-  // non-enumerable so the result still deep-equals a plain array of findings
   Object.defineProperty(out, 'covered', { value: covered, enumerable: false });
   return out;
+}
+
+const rawTemplate = (tpl, src) => src.slice(tpl.start + 1, tpl.end - 1);
+
+// split a class string on its interpolation syntax
+function splitInterp(str, re) {
+  const parts = [];
+  let last = 0, m;
+  re.lastIndex = 0;
+  while ((m = re.exec(str))) {
+    parts.push({ text: str.slice(last, m.index) });
+    last = m.index + m[0].length;
+  }
+  parts.push({ text: str.slice(last) });
+  return parts;
+}
+
+// markup has no AST here, but the shape is simple: split on the interpolation and take
+// the fragment either side. Nothing is resolvable, so it is reported, never called safe.
+function markupFragments(body, re, file, offs, at, out) {
+  const parts = splitInterp(body, re);
+  for (let i = 0; i < parts.length - 1; i++) {
+    const before = parts[i].text, after = parts[i + 1] ? parts[i + 1].text : '';
+    const prefix = (!before || /\s$/.test(before)) ? '' : before.split(/\s+/).pop();
+    const suffix = (!after || /^\s/.test(after)) ? '' : after.split(/\s+/)[0];
+    if (!prefix || !twHead(prefix)) continue;
+    const line = lineAt(offs, at);
+    if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix)) continue;
+    out.push({ file, line, fragment: prefix, suffix, via: 'markup', resolved: null, missing: ['?'],
+      expr: '"' + body.slice(0, 90) + '"' });
+  }
 }
 
 // blank JS comments so a commented-out var() is not counted as a live use
@@ -1031,7 +1420,8 @@ function main(argv) {
         console.log(C.dim('    resolves to ') + h.resolved.join(', ') + C.dim(how));
         console.log(C.r('    never generated: ') + h.missing.join(', '));
       } else {
-        console.log(C.dim('    cannot be resolved, and no class of this shape appears literally anywhere'));
+        console.log(C.y('    could not be resolved') +
+          C.dim(' — no call site gives it a literal value, so it cannot be proven safe'));
       }
     }
     if (safe.length) {
@@ -1185,5 +1575,6 @@ function main(argv) {
   reportClass(ix, target.replace(/^\./, ''));
 }
 
-module.exports = { buildIndex, usesTailwind, tailwindScope, literalClasses, propValues, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
+module.exports = { buildIndex, usesTailwind, tailwindScope, literalClasses, contentScope, gitIgnored, expandBraces,
+  parseFile, walkAst, staticValues, classExpressions, componentIndex, propBindings, callSiteValues, parseCss, parseSrc, lexCss, sanitizeCss, stripDirectives, scanTailwind, scanVars, cssRuleSpans, changedCssLines, planRename, planExtract, applyExtract };
 if (require.main === module) main(process.argv);

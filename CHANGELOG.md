@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.0.0
+
+`--tailwind` now reads a real syntax tree instead of guessing with regular expressions.
+
+Two adversarial passes found 10 defects each in the regex implementation, every one
+confirmed against a real Tailwind build. Fixing them individually worked, and the
+pattern in what had to be fixed was the actual finding: `<UI.Card>`, `React.createElement`,
+`{ color: c = 'blue' }` renaming, `props.color ?? 'blue'`, spread props, default
+parameters leaking from the next component, `token.replace('_', '-')`. Those are
+JavaScript semantics, and roughly 127 lines had accumulated trying to reimplement them
+with pattern matching. Each new syntactic form defeated it again.
+
+So this version parses. `@babel/parser` is now the single dependency, chosen after
+verifying it parses 1264 real source files on this machine with zero failures.
+
+Deleted, replaced by the tree: propValues, localNames, defaultParam, componentAt,
+tagBody, stripNestedJsx, exprLiterals, classRegions, balancedRegion.
+
+What that buys, beyond the 20 known defects staying fixed:
+- A class attribute's value is found structurally, so a template inside clsx, inside a
+  ternary, or three arguments deep is found, and a sibling `id={...}` never is.
+- Prop values come from real JSX attributes and real import bindings, so two components
+  sharing a name are never merged.
+- An expression that cannot be evaluated is known to be unevaluatable, rather than being
+  guessed at. Those are reported, never called safe.
+- A fragment with no prefix is only judged when its values resolve, so `${v.toFixed(1)}s`
+  and `${Math.round(v)}ms` are left alone.
+
+Same answers on real projects, and faster than the version that hung: the largest
+project here scans in about 1s.
+
 ## 2.4.0
 
 `--tailwind` now resolves the values a variable actually takes, instead of asking

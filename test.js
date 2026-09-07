@@ -80,14 +80,19 @@ w('src/Tw.jsx', [
 ].join('\n'));
 const tw = scanTailwind(root);
 const inTw = (arr) => arr.filter((h) => h.file.endsWith('Tw.jsx')).map((h) => h.line + ':' + h.fragment);
-assert.deepStrictEqual(inTw(tw), ['3:grid-cols-'], 'only the genuinely ungenerated one');
-assert.deepStrictEqual(inTw(tw.covered || []), ['1:bg-'],
-  'bg-${color}-100 is safe here because bg-red-100 is written literally on line 4');
+// nothing gives A or C a literal value, so neither can be proven safe. A class of the
+// same shape existing elsewhere is not proof that THIS one is generated.
+assert.deepStrictEqual(inTw(tw), ['1:bg-', '3:grid-cols-'], JSON.stringify(inTw(tw)));
+assert.deepStrictEqual(inTw(tw.covered || []), [], 'nothing here is provably safe');
 
-// remove the literal usage and the same line becomes a real bug
-w('src/Tw.jsx', 'const A = () => <div className={`bg-${color}-100 p-4`}/>;');
+// give it a real call site and the value resolves, so it can be judged properly
+w('src/Tw.jsx', [
+  'export const A = ({ color }) => <div className={`bg-${color}-100 p-4`}/>;',
+  'export const Use = () => <><A color="red"/><i className="bg-red-100"/></>;',
+].join('\n'));
 const tw2 = scanTailwind(root);
-assert.deepStrictEqual(inTw(tw2), ['1:bg-'], 'with nothing spelling it out, it is reported');
+assert.deepStrictEqual(inTw(tw2), [], 'resolved to bg-red-100, which is spelled out');
+assert.deepStrictEqual(inTw(tw2.covered || []), ['1:bg-'], 'and recorded as provably safe');
 
 // a ternary of string literals resolves to exact class names
 w('src/Tw3.jsx', "const A = () => <div className={`col-span-${w ? '1' : '2'}`}/>;");

@@ -1,6 +1,6 @@
 {
   "name": "whouses",
-  "version": "2.4.0",
+  "version": "3.0.0",
   "description": "Find who uses your CSS, including classes built at runtime that grep cannot see. Reads .css/.scss/.less and <style> blocks in HTML, Vue, Svelte and Astro. Flags Tailwind classes the JIT silently drops.",
   "keywords": [
     "css",
@@ -53,5 +53,8 @@
   "bugs": {
     "url": "https://github.com/Jatinsingla4/whouses/issues"
   },
-  "homepage": "https://github.com/Jatinsingla4/whouses#readme"
+  "homepage": "https://github.com/Jatinsingla4/whouses#readme",
+  "dependencies": {
+    "@babel/parser": "^7.29.0"
+  }
 }
