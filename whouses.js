@@ -415,8 +415,10 @@ const TW = new Set(('bg text border ring outline fill stroke from via to decorat
 // A fragment's utility root. Strips variant prefixes (hover:, md:) and any
 // arbitrary-value bracket, then walks back segment by segment, because a root can be
 // multi-segment: `text-gray-${n}` has prefix "text-gray-", whose root is "text".
+let twPrefix = '';
 function twHead(frag) {
   let h = frag.split(':').pop().split('[')[0].replace(/-+$/, '');
+  if (twPrefix && h.startsWith(twPrefix)) h = h.slice(twPrefix.length);
   while (h) {
     if (TW.has(h)) return h;
     const cut = h.lastIndexOf('-');
@@ -491,8 +493,49 @@ const LOCKFILES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '
 
 // Tailwind honours `@import "tailwindcss" source("./src")` and skips gitignored paths.
 // Counting text outside its real scope proved coverage that the build does not have.
+// Tailwind v3 keeps content globs, a class prefix and a safelist in tailwind.config.js.
+// None of it was read, which produced three separate wrong answers. The file is the
+// project's own config and Tailwind itself requires it, so require it here too.
+const cfgCache = new Map();
+function tailwindConfig(root) {
+  if (cfgCache.has(root)) return cfgCache.get(root);
+  let cfg = null;
+  for (const name of TW_CONFIGS) {
+    const p = path.join(root, name);
+    if (!fs.existsSync(p)) continue;
+    try {
+      delete require.cache[require.resolve(p)];
+      const m = require(p);
+      cfg = m && m.default ? m.default : m;
+    } catch { cfg = null; }
+    break;
+  }
+  cfgCache.set(root, cfg);
+  return cfg;
+}
+
+// a v3 safelist is strings or { pattern: /re/ } entries; a pattern matches classes
+// Tailwind will generate even though nothing spells them out
+function safelistFrom(cfg) {
+  const exact = [], patterns = [];
+  for (const item of (cfg && cfg.safelist) || []) {
+    if (typeof item === 'string') exact.push(item);
+    else if (item && item.pattern instanceof RegExp) patterns.push(item.pattern);
+  }
+  return { exact, patterns };
+}
+
 function contentScope(root) {
   const dirs = [];
+  const cfg = tailwindConfig(root);
+  const content = cfg && (Array.isArray(cfg.content) ? cfg.content : cfg.content && cfg.content.files);
+  if (Array.isArray(content)) {
+    for (const g of content) {
+      if (typeof g !== 'string') continue;
+      const stem = g.split(/[*{]/)[0];
+      dirs.push(path.resolve(root, stem).replace(/\/$/, ''));
+    }
+  }
   for (const f of walk(root)) {
     if (!CSS_EXT.has(path.extname(f))) continue;
     const src = read(f);
@@ -504,16 +547,58 @@ function contentScope(root) {
   return dirs;
 }
 
+// A literal path list missed `*.gen.ts`, and reading only the root missed a nested
+// .gitignore. Both are ordinary, and both made the tool count text Tailwind never sees.
+function globToRe(pattern) {
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') { re += '.*'; i++; if (pattern[i + 1] === '/') i++; }
+      else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else if ('.+^${}()|[]\\'.includes(c)) re += '\\' + c;
+    else re += c;
+  }
+  return re;
+}
+
 function gitIgnored(root) {
-  const out = [];
-  try {
-    for (let line of fs.readFileSync(path.join(root, '.gitignore'), 'utf8').split('\n')) {
-      line = line.trim();
-      if (!line || line.startsWith('#') || line.startsWith('!')) continue;
-      out.push(path.resolve(root, line.replace(/^\//, '').replace(/\/$/, '')));
+  const rules = [];
+  const collect = (dir) => {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (e.name === 'node_modules' || e.name === '.git') continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) collect(p);
+      else if (e.name === '.gitignore') {
+        let lines;
+        try { lines = fs.readFileSync(p, 'utf8').split('\n'); } catch { continue; }
+        for (let line of lines) {
+          line = line.trim();
+          if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+          const anchored = line.startsWith('/');
+          const body = line.replace(/^\//, '').replace(/\/$/, '');
+          const src = anchored ? '^' + globToRe(body) : '(^|/)' + globToRe(body);
+          rules.push({ base: dir, re: new RegExp(src + '($|/)') });
+        }
+      }
     }
-  } catch { /* no .gitignore is fine */ }
-  return out;
+  };
+  collect(root);
+  return rules;
+}
+
+// like walk(), but only prunes what Tailwind itself never reads
+function* walkAll(dir) {
+  let ents;
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of ents) {
+    if (e.name === 'node_modules' || e.name === '.git') continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) yield* walkAll(p); else yield p;
+  }
 }
 
 function literalClasses(root) {
@@ -522,13 +607,19 @@ function literalClasses(root) {
   const ignored = gitIgnored(root);
   const inScope = (f) => {
     const r = path.resolve(f);
-    if (ignored.some((i) => r === i || r.startsWith(i + path.sep))) return false;
+    if (ignored.some(({ base, re }) => {
+      if (!r.startsWith(base + path.sep)) return false;
+      return re.test(path.relative(base, r).split(path.sep).join('/'));
+    })) return false;
     if (!scope.length) return true;
     return scope.some((d) => r.startsWith(d + path.sep) || r === d);
   };
-  for (const f of walk(root)) {
+  // walkAll, not walk: Tailwind scans dist/, build/ and out/ unless they are gitignored,
+  // and gitignore is already handled above. Skipping them here invented missing classes.
+  for (const f of walkAll(root)) {
     if (NOT_SCANNED.test(f) || LOCKFILES.has(path.basename(f))) continue;
     if (!inScope(f)) continue;
+    try { if (fs.statSync(f).size > 4 * 1024 * 1024) continue; } catch { continue; }
     const src = read(f);
     if (src === null) continue;
     // permissive on purpose: Tailwind scans plain text, so a token anywhere in the
@@ -539,6 +630,11 @@ function literalClasses(root) {
     }
   }
   for (const c of safelisted(root)) set.add(c);
+  const sl = safelistFrom(tailwindConfig(root));
+  for (const c of sl.exact) set.add(c);
+  if (sl.patterns.length) {
+    Object.defineProperty(set, 'patterns', { value: sl.patterns, enumerable: false });
+  }
   return set;
 }
 
@@ -612,9 +708,20 @@ const PARSE_OPTS = {
   plugins: ['jsx', 'typescript', 'decorators-legacy', 'classProperties', 'dynamicImport'],
 };
 
+const FLOW_OPTS = { ...PARSE_OPTS, plugins: PARSE_OPTS.plugins.map((p) => (p === 'typescript' ? 'flow' : p)) };
+
 function parseFile(src) {
-  try { return parse(src, PARSE_OPTS); } catch { return null; }
+  try { return parse(src, PARSE_OPTS); } catch { /* try the other type syntax */ }
+  // flow and typescript cannot both be enabled, and React Native / legacy React
+  // codebases are full of `function f(x: ?string)` and `{| a: number |}`
+  try { return parse(src, FLOW_OPTS); } catch { return null; }
 }
+
+// A file the parser cannot read is a hole in the answer. Silently skipping one turned
+// "we could not evaluate this" into "these are fine", which is the tool telling you a
+// broken app is healthy. Every unparsed file is surfaced, and a call site living in one
+// makes the value set incomplete.
+const unparsed = [];
 
 function walkAst(node, visit, parent) {
   if (!node || typeof node.type !== 'string') return;
@@ -670,13 +777,48 @@ const jsxName = (n) => n.type === 'JSXIdentifier' ? n.name
 
 // every value a prop is given, across every call site of a component
 // which local names in this file refer to the component declared in defFile
-function importedAs(ast, file, defFile, component) {
+// tsconfig/jsconfig path aliases, so `@/ui/Badge` resolves instead of falling back to
+// bare-name matching, which merged two unrelated components called Badge
+const aliasCache = new Map();
+function aliasMap(root) {
+  if (aliasCache.has(root)) return aliasCache.get(root);
+  const out = [];
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(path.join(root, name), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')); } catch { continue; }
+    const co = cfg.compilerOptions || {};
+    const baseUrl = path.resolve(root, co.baseUrl || '.');
+    for (const [k, vals] of Object.entries(co.paths || {})) {
+      for (const v of vals) out.push({ prefix: k.replace(/\*$/, ''), target: path.resolve(baseUrl, v.replace(/\*$/, '')) });
+    }
+  }
+  aliasCache.set(root, out);
+  return out;
+}
+
+function resolveSpec(file, spec, root) {
+  if (spec.startsWith('.')) return path.resolve(path.dirname(file), spec);
+  for (const a of aliasMap(root)) {
+    if (a.prefix && spec.startsWith(a.prefix)) return path.resolve(a.target, spec.slice(a.prefix.length));
+  }
+  // no tsconfig: @/x and ~/x are conventionally <root>/src/x, falling back to <root>/x
+  const m = /^[@~]\/(.+)$/.exec(spec);
+  if (m) {
+    const inSrc = path.resolve(root, 'src', m[1]);
+    for (const e of ['', '.jsx', '.tsx', '.js', '.ts']) if (fs.existsSync(inSrc + e)) return inSrc;
+    return path.resolve(root, m[1]);
+  }
+  return null;
+}
+
+function importedAs(ast, file, defFile, component, root) {
   const names = new Set();
   if (path.resolve(file) === path.resolve(defFile)) names.add(component);
   if (!ast) return names;
   walkAst(ast, (n) => {
-    if (n.type !== 'ImportDeclaration' || !n.source.value.startsWith('.')) return;
-    const base = path.resolve(path.dirname(file), n.source.value);
+    if (n.type !== 'ImportDeclaration') return;
+    const base = resolveSpec(file, n.source.value, root);
+    if (!base) return;
     const target = path.resolve(defFile);
     const hit = ['', '.jsx', '.tsx', '.js', '.ts', '.mjs', '.vue', '.svelte']
       .some((e) => base + e === target || path.join(base, 'index' + e) === target);
@@ -690,6 +832,7 @@ function importedAs(ast, file, defFile, component) {
 }
 
 const csCache = new Map();
+let scanRoot = '.';
 function callSiteValues(files, component, prop, defFile) {
   const key = component + '\u0000' + prop + '\u0000' + (defFile || '');
   if (csCache.has(key)) return csCache.get(key);
@@ -704,8 +847,10 @@ function callSiteValuesUncached(files, component, prop, defFile) {
     let complete = true, sites = 0;
     for (const entry of files) {
       const { ast, file } = entry;
-      if (!ast) continue;
-      const names = byImport && defFile ? importedAs(ast, file, defFile, component) : new Set([component]);
+      // a .css or .md file having no AST is normal; a .jsx that failed to parse is not,
+      // and its call sites are invisible to us
+      if (!ast) { if (unparsed.includes(file)) complete = false; continue; }
+      const names = byImport && defFile ? importedAs(ast, file, defFile, component, scanRoot) : new Set([component]);
       if (!names.size) continue;
       walkAst(ast, (n) => {
         if (n.type === 'JSXOpeningElement' && names.has(jsxName(n.name))) {
@@ -772,6 +917,29 @@ function staticValues(node) {
       // `props.color ?? 'blue'` shows only the fallback, the left side is unknown
       const a = staticValues(node.left), b = staticValues(node.right);
       return { values: [...a.values, ...b.values], complete: a.complete && b.complete };
+    }
+    case 'CallExpression': {
+      const c = node.callee;
+      if (c.type !== 'MemberExpression' || c.property.name !== 'join') return { values: [], complete: false };
+      if (c.object.type !== 'ArrayExpression') return { values: [], complete: false };
+      const sep = node.arguments[0] && node.arguments[0].type === 'StringLiteral' ? node.arguments[0].value : ',';
+      let acc = [''];
+      for (let i = 0; i < c.object.elements.length; i++) {
+        const r = staticValues(c.object.elements[i]);
+        if (!r.complete || !r.values.length) return { values: [], complete: false };
+        const next = [];
+        for (const a of acc) for (const b of r.values) next.push(i ? a + sep + b : a + b);
+        acc = next;
+      }
+      return { values: acc, complete: true };
+    }
+    case 'BinaryExpression': {
+      if (node.operator !== '+') return { values: [], complete: false };
+      const l = staticValues(node.left), r = staticValues(node.right);
+      if (!l.complete || !r.complete || !l.values.length || !r.values.length) return { values: [], complete: false };
+      const out = [];
+      for (const a of l.values) for (const b of r.values) out.push(a + b);
+      return { values: out, complete: true };
     }
     case 'TSAsExpression':
     case 'TSSatisfiesExpression':
@@ -842,10 +1010,66 @@ function visibleBindings(file, ast, local) {
   return out;
 }
 
+// 'bg-' + tone + '-500' is a template literal wearing a different hat. Flatten it into
+// the same quasis/expressions shape so one code path judges both.
+function flattenConcat(node, acc) {
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    flattenConcat(node.left, acc);
+    flattenConcat(node.right, acc);
+    return acc;
+  }
+  acc.push(node);
+  return acc;
+}
+
+function joinAsTemplate(node) {
+  const c = node.callee;
+  if (c.type !== 'MemberExpression' || c.property.name !== 'join') return null;
+  if (c.object.type !== 'ArrayExpression') return null;
+  const sep = node.arguments[0] && node.arguments[0].type === 'StringLiteral' ? node.arguments[0].value : ',';
+  const quasis = [], expressions = [];
+  let text = '';
+  c.object.elements.forEach((el, i) => {
+    if (i) text += sep;
+    if (el && el.type === 'StringLiteral') { text += el.value; return; }
+    quasis.push({ value: { cooked: text } });
+    expressions.push(el);
+    text = '';
+  });
+  quasis.push({ value: { cooked: text } });
+  if (!expressions.length) return null;
+  return { quasis, expressions, start: node.start, end: node.end, synthetic: true };
+}
+
+function concatAsTemplate(node) {
+  const parts = flattenConcat(node, []);
+  if (parts.length < 2) return null;
+  const quasis = [], expressions = [];
+  let text = '';
+  for (const p of parts) {
+    if (p.type === 'StringLiteral') { text += p.value; continue; }
+    quasis.push({ value: { cooked: text } });
+    expressions.push(p);
+    text = '';
+  }
+  quasis.push({ value: { cooked: text } });
+  if (!expressions.length) return null;
+  return { quasis, expressions, start: node.start, end: node.end, synthetic: true };
+}
+
 function templatesIn(node, binds, seen = new Set()) {
   const out = [];
-  walkAst(node, (n) => {
+  walkAst(node, (n, parent) => {
     if (n.type === 'TemplateLiteral' && n.expressions.length) out.push(n);
+    if (n.type === 'CallExpression') {
+      const j = joinAsTemplate(n);
+      if (j) out.push(j);
+    }
+    if (n.type === 'BinaryExpression' && n.operator === '+' &&
+        !(parent && parent.type === 'BinaryExpression' && parent.operator === '+')) {
+      const t = concatAsTemplate(n);
+      if (t) out.push(t);
+    }
     // className={ring} where ring holds the template, or a helper that returns one
     if (n.type === 'Identifier' && !seen.has(n.name)) {
       seen.add(n.name);
@@ -868,10 +1092,54 @@ function scriptOf(file, src) {
   return out;
 }
 
+// A monorepo has one Tailwind build per app. A safelist in apps/a does not help apps/b,
+// and a single project-wide literal set credited one app's coverage to the other, so a
+// sibling app shipped unstyled while the tool said "nothing to fix".
+function entrypoints(root) {
+  const eps = [];
+  for (const f of walk(root)) {
+    if (!CSS_EXT.has(path.extname(f))) continue;
+    const src = read(f);
+    if (src === null || !/@tailwind\b|@import\s+["']tailwindcss/.test(src)) continue;
+    // the package this stylesheet belongs to bounds what its build can see
+    let dir = path.dirname(f), pkg = null;
+    for (;;) {
+      if (fs.existsSync(path.join(dir, 'package.json'))) { pkg = dir; break; }
+      const up = path.dirname(dir);
+      if (up === dir || !dir.startsWith(path.resolve(root))) break;
+      dir = up;
+    }
+    eps.push({ css: f, pkg: pkg || root });
+  }
+  return eps;
+}
+
 function scanTailwind(root) {
+  scanRoot = root;
+  const cfg0 = tailwindConfig(root);
+  twPrefix = (cfg0 && typeof cfg0.prefix === 'string') ? cfg0.prefix : '';
   csCache.clear();
+  unparsed.length = 0;
   const out = [], covered = [];
   const literals = literalClasses(root);
+  // one set per Tailwind build, when there is more than one
+  const eps = entrypoints(root);
+  const perEp = eps.length > 1
+    ? eps.map((e) => ({ ...e, set: literalClasses(e.pkg) }))
+    : [];
+  // a class is generated only if every build that can include this file generates it
+  const generated = (cls, file) => {
+    const relevant = perEp.filter((e) => path.resolve(file).startsWith(path.resolve(e.pkg) + path.sep) ||
+      path.resolve(file).startsWith(path.resolve(root) + path.sep));
+    if (!relevant.length) {
+      const pats = literals.patterns || [];
+      return literals.has(cls) || pats.some((re) => re.test(cls));
+    }
+    return relevant.every((e) => {
+      const pats = e.set.patterns || [];
+      return e.set.has(cls) || pats.some((re) => re.test(cls));
+    });
+  };
   let binds = null;
 
   const files = [];
@@ -880,7 +1148,9 @@ function scanTailwind(root) {
     if (!tailwindScope(f, root)) continue;
     const src = read(f);
     if (src === null) continue;
-    files.push({ file: f, src, ast: parseFile(scriptOf(f, src)), offs: lineOffsets(src) });
+    const ast = parseFile(scriptOf(f, src));
+    if (!ast && /\.(jsx?|tsx?|mjs|cjs)$/i.test(f)) unparsed.push(f);
+    files.push({ file: f, src, ast, offs: lineOffsets(src) });
   }
 
   const judge = (file, offs, tpl, node, ctx) => {
@@ -899,7 +1169,7 @@ function scanTailwind(root) {
         const resolved = resolveIdentifier(expr, ctx);
         if (resolved) { values = resolved.values; complete = resolved.complete; via = 'prop'; }
       }
-      const line = lineAt(offs, expr.start);
+      const line = lineAt(offs, ctx.at !== undefined ? ctx.at : expr.start);
       const entry = { file, line, fragment: prefix, suffix, via,
         expr: '`' + rawTemplate(tpl, ctx.src) + '`' };
       if (out.some((o) => o.file === file && o.line === line && o.fragment === prefix && o.suffix === suffix)) continue;
@@ -908,7 +1178,7 @@ function scanTailwind(root) {
       if (values.length && complete) {
         const produced = values.map((v) => prefix + v + suffix).filter((c) => twHead(c));
         if (!produced.length) continue;
-        const missing = produced.filter((c) => !literals.has(c));
+        const missing = produced.filter((c) => !generated(c, file));
         if (missing.length) out.push({ ...entry, resolved: produced, missing });
         else covered.push({ ...entry, resolved: produced });
       } else if (prefix) {
@@ -937,13 +1207,45 @@ function scanTailwind(root) {
 
   for (const entry of files) {
     const { file, src, ast, offs } = entry;
-    // markup attributes in single-file components and plain templates
-    if (HTML_EXT.has(path.extname(file)) || /\.(html?|hbs|ejs|erb|php|twig)$/i.test(file)) {
-      for (const m of src.matchAll(/\b(?::|v-bind:|\[)?class(?:Name)?\]?\s*=\s*"([^"]*)"/g)) {
-        const body = m[1];
-        const at = m.index + m[0].indexOf(body);
-        if (body.includes('{{')) markupFragments(body, /\{\{[\s\S]*?\}\}/g, file, offs, at, out);
-        else if (body.includes('${')) markupFragments(body.replace(/^`|`$/g, ''), /\$\{[^}]*\}/g, file, offs, at, out);
+    // Markup attributes. A bound attribute (:class, [ngClass], x-bind:class) holds a
+    // JavaScript expression, so it goes through the same tree path rather than earning
+    // its own regex. A plain attribute holds text interpolation, which does not.
+    if (HTML_EXT.has(path.extname(file)) || /\.(html?|hbs|ejs|erb|php|twig|liquid)$/i.test(file)) {
+      // \b before ':' never matches (space and colon are both non-word), [ngClass] is
+      // not literally "class", and Astro's class:list={...} value is not quoted at all.
+      const ATTR = /(?:^|[\s<])((?::|v-bind:|x-bind:|\[)?\s*(?:ng)?[Cc]lass(?::list)?\]?)\s*=\s*/g;
+      let m;
+      while ((m = ATTR.exec(src))) {
+        const bound = /^[:[]|bind:/.test(m[1].trim()) || /:list$/.test(m[1]);
+        const at = m.index + m[0].length;
+        const q = src[at];
+        let body;
+        if (q === '"' || q === "'") {
+          const end = src.indexOf(q, at + 1);
+          if (end < 0) continue;
+          body = src.slice(at + 1, end);
+        } else if (q === '{') {
+          let depth = 0, i = at;
+          for (; i < src.length; i++) {
+            if (src[i] === '{') depth++;
+            else if (src[i] === '}' && --depth === 0) break;
+          }
+          body = src.slice(at + 1, i);
+        } else continue;
+        if (!body) continue;
+        if (bound || q === '{') {
+          const expr = parseFile('(' + body + ')');
+          if (expr) {
+            for (const tpl of templatesIn(expr, new Map())) {
+              judge(file, offs, tpl, tpl, { src: '(' + body + ')', file, component: null, bindings: new Map(), at });
+            }
+            continue;
+          }
+        }
+        // text interpolation: {{ blade }}, ${ vue }, { svelte }, <%= erb %>
+        if (/\{\{|\$\{|<%=|\{[A-Za-z_$]/.test(body)) {
+          markupFragments(body.replace(/^`|`$/g, ''), /\{\{[\s\S]*?\}\}|\$\{[^}]*\}|<%=[\s\S]*?%>|\{[^{}]*\}/g, file, offs, at, out);
+        }
       }
     }
     if (!ast) continue;
@@ -958,10 +1260,11 @@ function scanTailwind(root) {
     }
   }
   Object.defineProperty(out, 'covered', { value: covered, enumerable: false });
+  Object.defineProperty(out, 'unparsed', { value: [...unparsed], enumerable: false });
   return out;
 }
 
-const rawTemplate = (tpl, src) => src.slice(tpl.start + 1, tpl.end - 1);
+const rawTemplate = (tpl, src) => tpl.synthetic ? src.slice(tpl.start, tpl.end) : src.slice(tpl.start + 1, tpl.end - 1);
 
 // split a class string on its interpolation syntax
 function splitInterp(str, re) {
